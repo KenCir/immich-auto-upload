@@ -1,8 +1,8 @@
-# Immich Desktop Uploader — Phase 1 / Phase 2
+# Immich Desktop Uploader — Phase 1 / Phase 2 / Phase 3
 
-Windows 11 / x64 向け。Phase 1 の process foundation と、Phase 2 の **単一 UploadSession の状態機械・再試行基盤**を実装しています。WinUI は最小ウィンドウのままです。
+Windows 11 / x64 向け。Phase 1 の process foundation、Phase 2 の単一 UploadSession の状態機械・再試行基盤、Phase 3 の **ImmichCliBackend / upload command / 単一フォルダの手動E2E入口**を実装しています。WinUI は最小ウィンドウのままです。
 
-UploadManager、実 Immich upload backend、設定保存、DPAPI、トレイ、自動起動、ConnectionMonitor、アップロード用 GUI は未実装です。実アップロード・API 呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
+UploadManager、設定保存、DPAPI、トレイ、自動起動、ConnectionMonitor、アップロード用 GUI は未実装です。実アップロードは明示的な資格情報を使う手動E2E入口に限定しています。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
 
 ## Build / run
 
@@ -293,6 +293,125 @@ backend は開始失敗前の部分的な生成物を自身で cleanup する契
 
 Phase 1 の本体コードと scripts は無変更です。既存テストランナーには Phase 2 テスト呼出しを追加しただけです。NuGet / 実 launcher の検証はアクセス可能な実行環境で、WinUI smoke test は通常環境で実行しました。Phase 2 の未実行ゲートはありません。実画像アップロードはスコープ外なので行っていません。
 
-## Next phase
+## Phase 3: single-folder CLI backend
 
-次の候補は IUploadBackend に対する実 ImmichCliBackend と upload 引数構築です。UploadManager・保存・GUI・DPAPI・ConnectionMonitor・トレイ等には今回着手していません。
+`UploadSession → IUploadBackend → ImmichCliBackend → ImmichUploadCommandBuilder → LauncherCommandBuilder → WindowsProcessRunner` を接続しました。Session は CLI オプションや認証方法を知りません。Backend は検証・互換性確認・起動だけを担当し、成功時に実 `IProcessRun` の所有権を Session に渡します。再試行は既存 Session の責務です。
+
+### Configuration / credentials
+
+`UploadRunRequest` の形は維持し、`UploadSessionConfiguration` に次の immutable な入力だけを追加しました。
+
+| 入力 | 初期値 |
+|---|---|
+| Recursive | true |
+| AlbumName | null |
+| IgnorePatterns | 空の ImmutableArray<string> |
+| Concurrency | 2 |
+
+FolderId / Path は従来どおりです。Enabled、UI状態、接続情報、保存用情報は追加していません。
+
+接続情報は別の `ImmichConnectionSettings` に保持します。公開の読み取り専用 ServerUrl と内部の読み取り専用 API Key を持ち、自動生成 ToString が秘密を出す record は使用しません。キーの永続保存はありません。ToString・通常の JSON シリアライズ・例外・Session snapshot・診断情報にキーを出さず、起動引数にも渡しません。
+
+Phase 1 の `CliEnvironmentBuilder` を再利用し、親環境を変更せず、子環境から大文字小文字を問わずすべての `IMMICH_*` を除去します。upload にだけアプリの `IMMICH_INSTANCE_URL` / `IMMICH_API_KEY` を設定します。E2E専用変数も子へ継承しません。version/help確認は認証変数なしです。stdout/stderr は Phase 1 の非同期取得と秘密のマスクをそのまま使用します。
+
+### Upload arguments and CLI compatibility
+
+実機の PATH launcher（Volta の `immich.cmd`）、Immich CLI **3.2.0** の `upload --help` で次の正式オプションを確認しました。
+
+| 設定 | 生成する引数 |
+|---|---|
+| 常時 | `upload --watch` |
+| Recursive=true | `--recursive`（falseなら省略） |
+| AlbumNameあり | `--album-name "値"` |
+| IgnorePatterns 1件 | `--ignore "pattern"` |
+| IgnorePatterns 複数 | `--ignore "{pattern1,pattern2}"` |
+| Concurrency | `--concurrency 2` 等 |
+| progress抑制 | 対応時に `--no-progress` |
+| 最後 | `-- "絶対フォルダパス"` |
+
+AlbumName は null / 空 / 空白のみなら省略し、それ以外では前後空白も保持します。IgnorePatterns が空なら省略します。Concurrency は正の Int32 とし、追加の上限は設けません。CLI側のデフォルト値には依存せず、アプリ初期値2を明示します。
+
+**ignore は繰り返し指定や単なるカンマ区切りではありません。** help の `--ignore <pattern>` は単一文字列です。インストール済み3.2.0の実装で、初回走査が fast-glob、watch が micromatch を使用することを確認し、複数の単純なパターンを設定順に brace alternation へまとめます。意味の変化を避けるため、複数指定の各要素に `{` / `}` / `,` / バックスラッシュ、または先頭 `!` がある場合は検証エラーにします。単一の `**/*.{jpg,png}` のようなパターンは保持します。CLI全体のglob言語をアプリ側で再実装することはしません。
+
+参考: [Immich CLI](https://docs.immich.app/features/command-line-interface/)、[micromatch braces](https://github.com/micromatch/micromatch#braces)、[fast-glob pattern syntax](https://github.com/mrmlnc/fast-glob#pattern-syntax)。互換性判定の実機基準は上記3.2.0です。
+
+Backend 初期化時に `--version` と `upload --help` を一度実行し、成功した機能確認をインスタンス内でキャッシュします。同時初期化は直列化し、各 Start で help を再実行しません。失敗・キャンセルはキャッシュしません。確認は各15秒、出力上限64 Ki文字で、子プロセスの終了・cleanup・出力回収も確認します。必須オプション不足や未知のignore引数形式は NonRetryable、`--no-progress` だけ未対応なら省略します。バージョンの完全固定はしません。CLI更新後はBackendを作り直して再確認します。
+
+起動は Phase 1 の PATH launcher方式です。npmのpackage.json/bin解析やNode直接起動は追加していません。任意のlauncherパス固定も可能ですが、プロセス起動自体は常に同じ本番実装を使います。
+
+### Validation / diagnostics
+
+- URL: absolute http(s)、userinfo/query/fragmentなし。末尾slashだけを除去し、hostやpathを書き換えず、`/api` を自動追加しません。3.2.0 CLI自身のdiscoveryと入力URLへのfallbackに任せます。手動検証にはサーバーの正しいAPIベースURL（通常は `/api` を含む）を指定します。
+- Folder: absolute、存在するdirectory、直下の列挙が可能であることを起動前に確認します。子孫全ファイルの読取保証や、検証後のアクセス権変更の防止までは行いません。
+- 値: 制御文字・オプションと誤認し得る先頭 `-` などを拒否します。CMD経由では Phase 1 の特殊文字制限も維持します。日本語・空白を含むパスは対応します。
+- NonRetryable: launcher不在、URL/キー/フォルダ/concurrency/引数の不備、必須CLI機能不足。
+- Retryable: ネイティブプロセス作成失敗、互換性probeの実行失敗。開始後の終了・観測障害は既存Sessionが処理します。
+
+例外階層を増やさず、既存 `UploadBackendException` に任意の固定 `BackendErrorCode` を追加しました。生の入力や内部例外は含めません。将来のログ連携用に、launcher path、値を省いたcommand summary、FolderId、RunGeneration、launcher PIDを bounded channel（32件、古い項目を破棄）で提供します。
+
+`--delete`、`--delete-duplicates`、その他削除動作、`--skip-hash` は生成しません。任意CLI引数の追加口もありません。認証情報入りのコマンドをログ出力する処理はありません。
+
+### Automated verification (2026-09-12)
+
+| 検証 | 結果 |
+|---|---|
+| solution build | 成功、警告0・エラー0 |
+| `scripts/Test.ps1` Phase 1 | 14成功 |
+| 同 Phase 2 | 25成功 |
+| 同 Phase 3 | 11成功 |
+| 合計 | **50成功、0失敗** |
+| `scripts/SmokeTest-WinUI.ps1` | 起動・応答・閉じる・exit code 0 |
+| 実CLI | 3.2.0、version/help成功、no-progress対応、Job所属とStop後のPID消滅を確認 |
+| `scripts/Upload-E2E.ps1` | skipped（資格情報未設定） |
+
+Phase 3 は引数の完全一致、設定初期値、URL正規化、キー秘匿、親環境隔離、空白/日本語パス、CMD拒否文字、読取拒否ACL、必須機能不足、互換性キャッシュ、probeキャンセル後のcleanupと再初期化、CreateProcess失敗分類を検証します。ACLテストは生成した一時フォルダだけを対象にし、元のアクセス規則への復元も確認します。
+
+本番Backendと安全な `ProcessTestHost` launcherを接続し、実IProcessRun、SessionのStarting/Running/Stopped、Job内の子孫終了、予期しないexitから2/5/10秒の3回再試行も検証します。通常テストの実Immich呼出しはversion/helpだけで、サーバーへの接続や実写真のuploadは行いません。
+
+Phase 1 本体と Phase 2 `UploadSession` は無変更です。Phase 2モデルの互換的拡張と既存テスト入口への追加だけを行いました。既存のsingle event loop、RunGeneration、stable reset、Stop intent、cleanup quarantine、active run <= 1を維持しています。
+
+### Opt-in / manual single-folder E2E
+
+通常の `scripts/Test.ps1` から独立した `scripts/Upload-E2E.ps1` を使います。実サーバー検証には対話可能なPowerShellと明示的な資格情報が必要です。次の例ではキーを対話入力し、コマンド履歴やリポジトリへ保存しません。
+
+```powershell
+$env:IMMICH_E2E_SERVER_URL = Read-Host 'Immich API base URL'
+$e2eSecureKey = Read-Host 'E2E API key' -AsSecureString
+try {
+    $env:IMMICH_E2E_API_KEY = [System.Net.NetworkCredential]::new('', $e2eSecureKey).Password
+    & .\scripts\Upload-E2E.ps1
+} finally {
+    Remove-Item Env:IMMICH_E2E_API_KEY -ErrorAction SilentlyContinue
+    Remove-Item Env:IMMICH_E2E_SERVER_URL -ErrorAction SilentlyContinue
+    $e2eSecureKey.Dispose()
+}
+```
+
+1. スクリプトはCLI互換性を確認し、毎回新しい空の `%TEMP%\ImmichDesktopUploader-E2E-<GUID>` を作ります。既存フォルダを指定する入力口はありません。
+2. 固定album名 `ImmichDesktopUploader-E2E`、recursive=true、concurrency=2でSessionを開始し、Runningとlauncher PID、実際の一時フォルダパスを表示します。
+3. 表示されたフォルダへ、アップロードしてよいテスト画像を**1枚だけ**コピーします。Runningはプロセス起動の確認であり、watch準備完了・upload成功の保証ではありません。
+4. CLIのwatch待ち時間（3.2.0では約10秒のバッチ待ち）も考慮し、Immich画面で画像のuploadとテストalbumへの所属を確認してEnterを押します。
+5. 同じ画像のバイト列を別ファイル名で再投入し、Immich画面で重複挙動とalbum所属を確認してEnterを押します。アプリから削除や重複判定の無効化は行いません。
+6. Session Stop後のStoppedとプロセス終了を確認します。Jobのtree cleanupに加えてlauncher PID消滅を確認し、Task Managerでも対応するlauncher/Nodeが残っていないことを確認できます。
+7. 中断はCtrl+Cです。失敗時もSessionをDisposeします。ローカル一時フォルダとサーバー上のテスト画像は確認用に残し、自動削除しません。
+
+Enterによる確認はユーザーによる手動確認として扱い、APIで検証済みとは表示しません。標準入力がredirectされている場合は実E2Eを開始しません。キーは実行中のメモリと子環境に存在しますが、出力やファイルには保存しません。
+
+今回の実行結果:
+
+```text
+Immich upload E2E: skipped
+Reason: E2E credentials not provided
+```
+
+したがって、実サーバーでのupload・album・重複挙動は今回未検証です。ユーザーの既存写真はアップロードしていません。
+
+### Files / limitations / next phase
+
+追加: `Infrastructure/Immich/ImmichConnectionSettings.cs`、`ImmichUploadCommandBuilder.cs`、`ImmichCliBackend.cs`、`tests/ImmichDesktopUploader.Tests/Immich/` のbackend testsとE2E入口、`tests/ProcessTestHost/ImmichFixture.cs`、`scripts/Upload-E2E.ps1`。
+
+変更: `Application/UploadSessionModels.cs`、両テストプロジェクトの `Program.cs`、本README。コミットは自動実行しません。
+
+CLI出力の文面からupload成功やwatch準備完了を推定しません。Phase 1のストリームマスクは、静かなプロセスの末尾出力を一時保持することがあります。そのためtreeテストは出力PIDの到着に依存せずJobのメンバーを検査します。ignoreの複雑な複数パターン、CMD制限文字、サーバーバージョン間の実upload互換性には上記制約があります。
+
+次の候補はUploadManagerと設定管理の設計・実装です。Phase 3では複数フォルダ管理、設定保存、DPAPI、ConnectionMonitor、server-info polling、ネットワーク回復、GUI、tray、自動起動へ進んでいません。

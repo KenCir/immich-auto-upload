@@ -6,8 +6,10 @@ using ImmichDesktopUploader.Application;
 using ImmichDesktopUploader.Infrastructure.Immich;
 using ImmichDesktopUploader.Infrastructure.Windows;
 using ImmichDesktopUploader.Tests.Sessions;
+using ImmichDesktopUploader.Tests.Immich;
 
 if (!OperatingSystem.IsWindows()) { Console.Error.WriteLine("Windows integration tests require Windows."); return 2; }
+if (args.SequenceEqual(new[] { "--upload-e2e" })) return await SingleFolderE2E.RunAsync();
 var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
 var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
 var host = Path.Combine(root, "tests", "ProcessTestHost", "bin", configuration, "net10.0", "ProcessTestHost.exe");
@@ -232,6 +234,7 @@ try
 }
 finally { Directory.Delete(temp, true); }
 await UploadSessionTests.RunAllAsync(Test);
+await ImmichBackendTests.RunAllAsync(host, Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 

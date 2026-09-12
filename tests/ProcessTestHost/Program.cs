@@ -9,6 +9,9 @@ var mode = args.ElementAtOrDefault(0) ?? "exit";
 var value = int.TryParse(args.ElementAtOrDefault(1), out var n) ? n : 0;
 switch (mode)
 {
+    case "immich-fixture": return await ImmichFixture.RunAsync(args.Skip(3).ToArray(), args[1], args[2]);
+    case "--version":
+    case "upload": return await ImmichFixture.RunAsync(args);
     case "args": Console.Write(JsonSerializer.Serialize(args.Skip(1))); break;
     case "env":
         Console.Write(JsonSerializer.Serialize(Environment.GetEnvironmentVariables().Cast<System.Collections.DictionaryEntry>()

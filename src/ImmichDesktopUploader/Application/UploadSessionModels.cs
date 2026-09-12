@@ -1,3 +1,5 @@
+using System.Collections.Immutable;
+
 namespace ImmichDesktopUploader.Application;
 
 public enum UploadSessionStatus { Stopped, Starting, Running, Restarting, Stopping, Error }
@@ -10,8 +12,14 @@ public sealed record SessionSnapshot(Guid FolderId, UploadSessionStatus Status, 
     int? LauncherPid, int RetryCount, DateTimeOffset? LastStartedAt, DateTimeOffset? LastActivityAt,
     SessionError? LastError, SessionStopReason? StopReason);
 
-// Only identity/path are needed in Phase 2. No credentials, CLI arguments or persisted settings.
-public sealed record UploadSessionConfiguration(Guid FolderId, string Path);
+// Immutable upload inputs only; no credentials, UI state or persisted settings.
+public sealed record UploadSessionConfiguration(Guid FolderId, string Path)
+{
+    public bool Recursive { get; init; } = true;
+    public string? AlbumName { get; init; }
+    public ImmutableArray<string> IgnorePatterns { get; init; } = [];
+    public int Concurrency { get; init; } = 2;
+}
 public sealed record UploadRunRequest(UploadSessionConfiguration Configuration, long RunGeneration);
 
 public interface IUploadBackend
@@ -24,10 +32,17 @@ public interface IUploadBackend
 public sealed class UploadBackendException : Exception
 {
     public BackendFailureKind FailureKind { get; }
-    public UploadBackendException(BackendFailureKind failureKind)
-        : base(failureKind == BackendFailureKind.NonRetryable
-            ? "Backend cannot start with the current configuration." : "Backend start failed.")
-        => FailureKind = failureKind;
+    public BackendErrorCode ErrorCode { get; }
+    public UploadBackendException(BackendFailureKind failureKind, BackendErrorCode errorCode = BackendErrorCode.Unspecified)
+        : base($"Upload backend failure: {failureKind} / {errorCode}.")
+    { FailureKind = failureKind; ErrorCode = errorCode; }
+}
+
+// Fixed diagnostic codes, never raw input or an inner exception carrying credentials.
+public enum BackendErrorCode
+{
+    Unspecified, LauncherNotFound, InvalidFolder, InvalidServerUrl, MissingApiKey,
+    InvalidConcurrency, InvalidArguments, UnsupportedCli, ProcessCreationFailed, CompatibilityProbeFailed
 }
 
 // A small delay boundary lets tests explicitly deliver even a late, canceled timer completion.
