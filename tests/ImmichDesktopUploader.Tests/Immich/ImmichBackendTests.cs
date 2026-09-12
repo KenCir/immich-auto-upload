@@ -146,6 +146,9 @@ internal static class ImmichBackendTests
             foreach (var file in Directory.EnumerateFiles(Path.GetDirectoryName(host)!)) File.Copy(file, Path.Combine(binaryDirectory, Path.GetFileName(file)));
             var executable = Path.Combine(binaryDirectory, Path.GetFileName(host));
             var backend = new ImmichCliBackend(Connection(), executable); await backend.InitializeAsync();
+            // Windows can briefly retain a mapped image after process exit. Rename the old image
+            // and create an invalid executable at the pinned path instead of rewriting its mapping.
+            File.Move(executable, executable + ".previous");
             await File.WriteAllTextAsync(executable, "not an executable");
             try { await using var unexpected = await backend.StartAsync(new(f.Configuration, 1), default); throw new Exception("Start should fail."); }
             catch (UploadBackendException e) { Equal(BackendFailureKind.Retryable, e.FailureKind); Equal(BackendErrorCode.ProcessCreationFailed, e.ErrorCode); }

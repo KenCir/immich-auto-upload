@@ -7,7 +7,7 @@ namespace ImmichDesktopUploader.Application;
 /// external work. Start/Restart/Apply acknowledge intent; Stop waits for cleanup. Observe Snapshot
 /// or Changes for Starting -> Running/Error. Caller cancellation only cancels the caller's wait.
 /// </summary>
-public sealed class UploadSession : IAsyncDisposable
+public sealed class UploadSession : IManagedUploadSession
 {
     private static readonly TimeSpan[] Backoffs = [TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10)];
     private static readonly TimeSpan StableDuration = TimeSpan.FromSeconds(30);

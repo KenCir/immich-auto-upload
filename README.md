@@ -1,8 +1,8 @@
-# Immich Desktop Uploader — Phase 1 / Phase 2 / Phase 3
+# Immich Desktop Uploader — Phase 1–4
 
-Windows 11 / x64 向け。Phase 1 の process foundation、Phase 2 の単一 UploadSession の状態機械・再試行基盤、Phase 3 の **ImmichCliBackend / upload command / 単一フォルダの手動E2E入口**を実装しています。WinUI は最小ウィンドウのままです。
+Windows 11 / x64 向け。プロセス基盤、単一UploadSession、ImmichCliBackendに加えて、Phase 4の **設定保存 / DPAPI / UploadManager / AppCoordinator** を実装しています。WinUI は最小ウィンドウのままです。
 
-UploadManager、設定保存、DPAPI、トレイ、自動起動、ConnectionMonitor、アップロード用 GUI は未実装です。実アップロードは明示的な資格情報を使う手動E2E入口に限定しています。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
+Applicationサービスは実行可能ですが、GUIへの接続、トレイ、自動起動、ConnectionMonitorは未実装です。通常テストで実アップロードは行わず、手動E2E入口を分離しています。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
 
 ## Build / run
 
@@ -414,4 +414,174 @@ Reason: E2E credentials not provided
 
 CLI出力の文面からupload成功やwatch準備完了を推定しません。Phase 1のストリームマスクは、静かなプロセスの末尾出力を一時保持することがあります。そのためtreeテストは出力PIDの到着に依存せずJobのメンバーを検査します。ignoreの複雑な複数パターン、CMD制限文字、サーバーバージョン間の実upload互換性には上記制約があります。
 
-次の候補はUploadManagerと設定管理の設計・実装です。Phase 3では複数フォルダ管理、設定保存、DPAPI、ConnectionMonitor、server-info polling、ネットワーク回復、GUI、tray、自動起動へ進んでいません。
+Phase 3時点ではUploadManagerと設定管理は次の候補でした。現在の実装は以下のPhase 4を参照してください。
+
+## Phase 4: Settings Persistence / DPAPI / UploadManager
+
+### Settings model and storage
+
+保存先は `AppStoragePaths` で一元化します。既定は次の3ファイルで、テスト時だけ専用の一時ディレクトリを注入します。
+
+```text
+%LocalAppData%\ImmichDesktopUploader\settings.json
+%LocalAppData%\ImmichDesktopUploader\settings.json.bak
+%LocalAppData%\ImmichDesktopUploader\credentials.dat
+```
+
+`AppSettings` / `UploadFolderSettings` はimmutable record、Folders / IgnorePatternsはImmutableArrayです。フォルダIdは `UploadFolderSettings.Create(path)` で新規作成時だけ生成し、編集では既存Idを維持します。デシリアライズ時に不足Idを自動生成しません。保存されるJSONの例（架空のURLとId）:
+
+```json
+{
+  "schemaVersion": 1,
+  "serverUrl": "https://immich.example.com/api",
+  "startWithWindows": false,
+  "folders": [
+    {
+      "id": "458bf5ca-5a16-4fb1-9397-c38a4244b681",
+      "path": "C:\\Pictures\\VRChat",
+      "enabled": true,
+      "recursive": true,
+      "albumName": null,
+      "ignorePatterns": [],
+      "concurrency": 2
+    }
+  ]
+}
+```
+
+Enabled=true、Recursive=true、Concurrency=2、AlbumName=null、IgnorePatterns=[] が初期値です。StartWithWindowsは保存だけで、レジストリを操作しません。API Key、Pause状態、SessionSnapshotはJSONに含めません。
+
+`SettingsValidation` はschema=1、Phase 3と共通のURL検証、GUID重複、絶対パス、パス重複、正のconcurrencyを検証します。フォルダの存在は保存時には要求せず、起動時のPhase 3 backendで確認します。URLは末尾slashのみ正規化し、`/api`を追加しません。
+
+比較用PathKeyは `Path.GetFullPath` → separatorをバックスラッシュへ統一 → root以外の末尾separator除去、比較はOrdinalIgnoreCaseです。大文字小文字、`/`と`\`、末尾slash、`.`を含む表現の差は重複として拒否します。親子判定はseparator境界を使い、`Pictures` と `PicturesElse` を親子と誤認しません。親子フォルダは許可し、`ValidatedSettings.Warnings` とManager snapshotのWarningsに親子のFolderIdを返します。
+
+### Atomic save / corruption / schema
+
+`SettingsService` はload/validate/save/recoveryのみを担当し、Sessionを操作しません。
+
+1. draftを検証してserializeする。
+2. 同じディレクトリの一意なtemporary fileへ書く。
+3. FlushAsyncとFlush(flushToDisk:true)を完了する。
+4. 初回はMove、既存ファイルにはFile.Replaceを使用する。
+5. 置換前の正常なprimaryを `settings.json.bak` に残す。
+
+通常Saveは既存primaryも検証してから置換します。サービス内の操作は直列化し、`.lock` ファイルをFileShare.Noneで開いて別SettingsServiceの同時書込みも拒否します。ロックファイルは空のまま残り、所有権はファイルハンドルにあります。書込み権限・共有違反などはStorageFailureで返し、直接上書きへfallbackしません。temporary fileはfinallyで回収します。
+
+ファイルなしはMissingSettingsです。既定設定の自動保存や自動uploadはしません。破損JSON、必須項目不足、重複JSONプロパティ、未対応schemaは明確なfailureとして返します。未知のJSON項目も拒否し、誤ってキー等を通常設定として扱いません。schemaが1以外ならUnsupportedSchemaで、通常Saveは禁止です。Phase 4にmigrationはありません。
+
+primaryを読めない場合、有効な `.bak` があれば `SettingsLoadResult.RecoveryCandidate` を返しますが、自動採用はしません。明示的な `RecoverBackupAsync()` だけが復旧し、拒否したprimaryは `.rejected-<GUID>` に保存します。元の `.bak` は維持します。future schemaのprimaryは復旧APIでも上書きしません。復旧後も資格情報の整合性確認が必要です。
+
+### CredentialService / consistency
+
+`CredentialService` はAPI Keyと対応ServerUrl、内部format versionをまとめてJSON bytesへ変換し、Windows DPAPIの **DataProtectionScope.CurrentUser** で暗号化して `credentials.dat` へatomic保存します。同じWindowsユーザーで復号します。これは[.NET ProtectedData](https://learn.microsoft.com/en-us/dotnet/api/system.security.cryptography.protecteddata)を使用する実装で、パッケージは `System.Security.Cryptography.ProtectedData 10.0.0` です。
+
+復号後、共通のURL正規化を行い、settings.ServerUrlとOrdinalで一致する場合だけ `ImmichConnectionSettings` を返します。hostの大文字小文字等も含め、意味上同じでも表記が異なるURLは保守的にmismatchとなる場合があります。別URLへ古いキーを転用することはありません。
+
+- ファイルなし: MissingCredentials。
+- DPAPI復号失敗・不正payload: InvalidCredentials。平文fallbackなし、再入力が必要です。
+- URL不一致: CredentialMismatch。Sessionは1つも開始しません。
+- byte bufferは使用後にZeroMemoryします。接続に必要なstringだけを保持し、完全なstringゼロ化は保証しません。
+- キーは通常JSON、ToString、例外、診断イベント、Manager/Session snapshotに出しません。内部のpayloadもToStringでは値を表示しません。
+
+### UploadManager / factory / diff
+
+`IManagedUploadSession` は既存UploadSessionの公開操作を表す最小interfaceです。UploadSessionの状態機械は変更せず、このinterfaceを実装する宣言だけを追加しました。`IUploadSessionFactory.Create(configuration)` でManagerから生成を分離します。
+
+本番 `UploadSessionFactory` は同一接続に対して1つのImmichCliBackendを共有します。Backendの機能確認はSemaphoreSlimで直列化・キャッシュ済みで、WindowsProcessRunnerの各Startは独立したJob/handlesを所有します。SessionごとのRetry/RunGeneration/cleanupは共有しません。
+
+UploadManagerはFolderIdをキーにSessionを所有します。StartAllでEnabledだけを開始し、DisabledもStoppedのSessionとして保持します。バックエンド開始失敗は各SessionのErrorとなり、他フォルダの開始を妨げません。ApplySettingsは事前に全draftを検証し、以下の差分だけを適用します。
+
+| 差分 | 動作 |
+|---|---|
+| 変更なし / StartWithWindowsのみ | Session操作なし |
+| 追加 | Session作成。実行要求中かつEnabledでPause中でなければ開始 |
+| Path / Recursive / AlbumName / IgnorePatterns / Concurrency変更 | 同じFolderIdのSessionだけ再設定 |
+| Enabled true→false | Stop(Disabled) |
+| Enabled false→true | 実行要求・Pause状態に従って開始 |
+| 削除 | Stop(Removed) → Dispose → dictionaryから削除 |
+
+IgnorePatternsは配列の参照でなく順序を含む内容で比較します。Path変更でも同じFolderIdなら同じSessionです。Disabled・Pause・StopAll中の編集は保留し、次の開始時に最新configurationを渡します。これは既存ApplyConfigurationAsyncが再起動を伴うためです。保留中の設定はManager snapshotに反映されます。
+
+削除cleanupが失敗した場合はidentityを隔離して保持し、同Idの新SessionやManual Restartを許可しません。安全に所有権を確認できない状態を成功扱いにしません。
+
+### Pause / Resume / shutdown
+
+Pauseはruntime-onlyでEnabledを保存変更しません。Pause時点でErrorではないSessionをStop(Paused)します。既にErrorだったSessionはErrorを維持し、Resume対象から外します。手動Restartで明示的に解除します。DisabledまたはPause中の手動Restartは拒否します。
+
+Pause中に追加・編集したEnabledフォルダはResume時に開始できます。StopAllは実行要求自体を解除するので、その後の編集やResumeだけで停止済みフォルダを起動しません。StartAllまたは対象へのManual Restartが必要です。
+
+Manager操作は順序付きのasync queueで直列化します。公開APIのCancellationTokenは呼出し側の待機だけを取り消し、受理済み操作やcleanupを放棄しません。すべての内部Taskを観測します。Start/ApplyのSession操作発行とDisposeの受付終了を同じlockで保護します。
+
+StopAllは全Sessionを並列停止し、`ManagerOperationResult.FailedFolderIds` に全失敗を集約します。Disposeは受付を即時終了し、先行操作の終了を待ち、全SessionのStop(ApplicationShutdown)とDisposeを個別に観測してdictionaryを空にします。一部でもcleanup失敗があればCleanupFailedを返します。Dispose後の新操作はObjectDisposedExceptionです。cleanup不能な外部プロセスが絶対に存在しないと偽って報告することはありません。
+
+Snapshotはimmutableなフォルダ設定と各Sessionの最新Snapshot、IsPaused、RunningRequested、Warningsを返します。ResumeBlockedでPause前のErrorによる抑止も確認できます。可変Session辞書を公開しません。
+
+### AppCoordinator / save ordering
+
+Application層のAppCoordinatorが、SettingsServiceとCredentialService、Managerの順序を管理します。Startは次の順です。
+
+```text
+settings load/validate → credentials load/URL照合 → shared backend factory → manager → Enabled start
+```
+
+どこかで設定・資格情報が不正ならManagerを生成しません。server-info、接続状態polling、ネットワーク回復は含めません。
+
+Updateは既存primaryの破損・未対応schemaも事前確認してから次の順で進め、保存が完了するまで現在のSessionを操作しません。未対応schemaではcredentialsも変更しません。
+
+```text
+draft validation
+→ 新credentialsを指定した場合はそのURL照合とDPAPI保存
+→ settings atomic save
+→ 両ファイルを再loadし、draft・URL・期待するcredentialとの一致を確認
+→ runtimeへ差分適用
+```
+
+通常のフォルダ変更は既存Managerに差分適用します。URLまたはキーが変わる場合だけ、全旧SessionをStop/Disposeしてから新しい共有backend contextとManagerへ切替えます。Pause/StopAll状態とResumeBlockedは引き継ぎます。cleanupに失敗した場合、新contextは作りません。
+
+2ファイルの分散transactionや秘密の自動rollbackは実装しません。credentials保存成功後にsettings保存が失敗しても、旧runtimeは旧immutable connectionで継続し、新設定を部分適用しません。次回起動時にURLが違えばmismatchで停止します。同じURLのキー更新だけが保存された場合は、次回起動はその新キーを使います。settings先行・credential失敗の手動編集状態もURL照合で拒否します。
+
+初回のUpdateは保存だけで、暗黙にuploadを始めません。保存後にStartを呼びます。開始後のStartAll/StopAll/PauseAll/ResumeAll/RestartはCoordinator経由でも利用できます。現在のGUIには結線していません。
+
+### Diagnostics / limitations
+
+`AppDiagnostics.Events` は128件のbounded channelで、settings/credentials load/save、session追加/削除/変更、pause/resume、manager start/stop、整合性failureを固定enumとFolderIdで返します。値や秘密を含む例外をログ化しません。ファイルloggerは未実装です。
+
+設定の保存前validationと保存失敗に対してruntimeを維持しますが、保存後に起きた実プロセスのcleanup失敗まで全セッションを巻き戻すtransactionはありません。その場合はfailureを返して新しい所有権の生成を止めます。外部からの設定手編集や複数アプリによる協調しない書込みを統合する機能もありません。
+
+atomic saveは同一volumeでのWindows File.Replace/Moveを前提とし、ストレージ機器故障などに対する完全な電源断保証はしません。junction/symlink/8.3名の同一実体判定、古いschema migration、キーのメモリ完全消去はスコープ外です。
+
+### Verified results (2026-09-13)
+
+| 検証 | 結果 |
+|---|---|
+| solution build | 成功、警告0・エラー0 |
+| Phase 1 regression | 14成功 |
+| Phase 2 regression | 25成功 |
+| Phase 3 regression | 11成功 |
+| Phase 4 | 25成功（保存/DPAPI 7、Manager 10、Coordinator 8） |
+| `scripts/Test.ps1` 合計 | **75成功、0失敗** |
+| WinUI smoke | 起動・応答・終了、exit code 0 |
+| 実CLI version/help | 3.2.0、既存Job所属・Stop検証成功 |
+| Phase 3 E2E入口 | ビルド・起動成功、資格情報なしで指定どおりskip |
+
+追加テストには、first run、atomic replacementと前版backup、backupをロックした保存失敗で両ファイル維持、破損/未来schemaの上書き拒否、明示復旧、パス重複/親子warning、実DPAPI roundtripと暗号化bytes検査、URL mismatch、秘密が通常設定・シリアライズ・診断へ出ないことを含みます。
+
+Managerはfake session/factoryで差分、Enabled、Pause/Error、並行Apply、shutdown fence、cleanup failureを決定的に検証します。さらに本番UploadSessionとfake backend/clockを使って、Starting中の削除が遅いrunを回収すること、retry中の編集が旧generationを起動しないことを検証します。Coordinatorは実filesystem+DPAPIとも接続し、保存失敗によるruntime部分適用なし、URL/key変更時の所有権切替、Pause/Error維持を確認します。実uploadは行っていません。
+
+Phase 3テスト1件は、終了直後のEXE mappingによる共有違反を避けるため、旧テストEXEをrenameしてから同じpin先に不正EXEを作るよう変更しました。CreateProcess failureの検証内容は維持しています。Phase 3のE2Eスクリプトと実行コードは無変更です。今回の結果は `Immich upload E2E: skipped / Reason: E2E credentials not provided` であり、過去の手動E2Eを再実行したという意味ではありません。
+
+### Files changed / next phase
+
+追加ファイル:
+
+- `Application/AppSettings.cs` — 設定、検証、warning、固定failure。
+- `Application/AppDiagnostics.cs` — 秘密を含まないイベント境界。
+- `Application/UploadSessionFactory.cs` — 最小Session interfaceと共有backend factory。
+- `Application/UploadManager.cs` — 複数Session管理。
+- `Application/AppCoordinator.cs` — 保存・資格情報・runtimeの順序管理。
+- `Infrastructure/Persistence/AtomicFile.cs` / `SettingsService.cs` / `CredentialService.cs` — 永続化。
+- `tests/ImmichDesktopUploader.Tests/Management/` — fake、保存、Manager、Coordinatorテスト。
+
+変更はUploadSessionのinterface宣言、ImmichConnectionSettingsのURL検証共通化と内部比較、DPAPIパッケージ参照、既存テスト入口、Phase 3のテスト準備1件、本READMEです。Phase 1のプロセス基盤とPhase 2の状態機械は維持しました。コミットは実行していません。
+
+次の推奨フェーズは、これらのApplicationサービスを利用するGUIの設定編集・フォルダ一覧です。今回GUI、tray、HKCU Run、自動起動、ConnectionMonitor、server-info pollingには着手していません。

@@ -235,6 +235,9 @@ try
 finally { Directory.Delete(temp, true); }
 await UploadSessionTests.RunAllAsync(Test);
 await ImmichBackendTests.RunAllAsync(host, Test);
+await ImmichDesktopUploader.Tests.Management.PersistenceTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Management.UploadManagerTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Management.CoordinatorTests.RunAllAsync(Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 
