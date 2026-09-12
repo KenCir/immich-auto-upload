@@ -5,6 +5,7 @@ using System.Text.RegularExpressions;
 using ImmichDesktopUploader.Application;
 using ImmichDesktopUploader.Infrastructure.Immich;
 using ImmichDesktopUploader.Infrastructure.Windows;
+using ImmichDesktopUploader.Tests.Sessions;
 
 if (!OperatingSystem.IsWindows()) { Console.Error.WriteLine("Windows integration tests require Windows."); return 2; }
 var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
@@ -230,6 +231,7 @@ try
     });
 }
 finally { Directory.Delete(temp, true); }
+await UploadSessionTests.RunAllAsync(Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 

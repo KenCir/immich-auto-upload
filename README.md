@@ -1,8 +1,8 @@
-# Immich Desktop Uploader — Phase 1
+# Immich Desktop Uploader — Phase 1 / Phase 2
 
-Windows 11 / x64 向けの **process foundation のみ**。WinUI 3 Unpackaged の最小ウィンドウと、既存 CLI launcher の起動・出力取得・ツリー停止を実装しています。
+Windows 11 / x64 向け。Phase 1 の process foundation と、Phase 2 の **単一 UploadSession の状態機械・再試行基盤**を実装しています。WinUI は最小ウィンドウのままです。
 
-UploadSession、UploadManager、再試行、設定保存、DPAPI、トレイ、自動起動、ConnectionMonitor、アップロード用 GUI は未実装です。実アップロード・API 呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
+UploadManager、実 Immich upload backend、設定保存、DPAPI、トレイ、自動起動、ConnectionMonitor、アップロード用 GUI は未実装です。実アップロード・API 呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
 
 ## Build / run
 
@@ -156,7 +156,7 @@ Immich CLI実機検証: skipped
 Reason: CLI not found
 ```
 
-## Verified results (2026-09-12)
+## Phase 1 verified results (2026-09-12)
 
 - .NET SDK 10.0.401、Windows 11 x64。
 - solution build: warnings 0 / errors 0。
@@ -172,6 +172,127 @@ Reason: CLI not found
 
 昇格した実行環境からの WinUI smoke test は1回、ウィンドウ生成成功後の終了待ちが5秒でタイムアウトしました（スクリプトが対象を cleanup）。通常のデスクトップ実行環境で同じスクリプトを再実行すると起動・応答・終了コード0まで成功しました。差の原因は未特定です。WinUI の通常実行成功と、CLI 統合テストの成功は分けて記録しています。
 
+## Phase 2 — UploadSession / State Machine / Retry Foundation
+
+### Boundary and immutable state
+
+`Application/UploadSession.cs` と `UploadSessionModels.cs` を追加しました。Phase 1 の process foundation 本体には変更を加えていません。
+
+```
+UploadSession (one folder)
+    ↓ IUploadBackend.StartAsync(UploadRunRequest, CancellationToken)
+    ↓ IProcessRun (Phase 1 contract)
+```
+
+`UploadSessionConfiguration` は FolderId と Path の immutable record のみ。`UploadRunRequest` は設定スナップショットと RunGeneration を持ちます。CLI の引数・認証・Windows Process・Job handle は UploadSession にありません。実 backend の実装は次フェーズです。
+
+公開状態は immutable `SessionSnapshot` です。FolderId、Status、RunGeneration、LauncherPid、RetryCount、LastStartedAt、LastActivityAt、LastError、StopReason を含み、`Snapshot` を atomic に差し替えます。
+
+`Changes` は最新64件の snapshot 通知キュー（単一 consumer 用、broadcast ではない）です。遅い consumer は古い通知を失う場合があります。現在値の正本は `Snapshot` です。UI の DispatcherQueue への転送は将来の UI 層の責務です。
+
+LastError は日時・種別・固定の安全な要約・任意の exit code を持ち、Running 復帰後にも保持します。backend の例外 Message / ToString や ProcessStartSpecification 全体を公開状態へコピーしません。出力内容は解析・保存せず、出力を受信した時刻だけ LastActivityAt に反映します。stdout/stderr を成功判定に使いません。出力通知は coalesce し、1 run あたり未処理 activity event を最大1件に抑えます。
+
+### Public operation semantics
+
+| 操作 | 挙動 / await の意味 |
+|---|---|
+| `StartAsync` | Stopped から開始要求。要求が event loop に受理されたら完了。Starting / Running / Restarting / Stopping / Error では冪等な no-op |
+| `RestartAsync` | retry count を0にし、旧実行を意図的に停止して新世代を開始。要求受理まで待機。新 run が Running になるか開始失敗するまで、同じ restart 操作の連打を coalesce |
+| `ApplyConfigurationAsync` | 同じ FolderId の新設定を採用し、SettingsChanged 理由で明示的に再スタート。要求受理まで待機。停止中の連続変更は最新設定を次の run に使用 |
+| `StopAsync` | desired running を先に false にし、timer を無効化。開始処理・現 run の cleanup 完了まで待機。cleanup 失敗は安全な固定メッセージの例外 |
+| `DisposeAsync` | 新要求を拒否、停止、全 background work の観測、event loop 終了まで待機。繰り返しは同じ終了 Task を返す |
+
+Start/Restart の await は Running 到達を意味しません。Snapshot / Changes で結果を確認します。Stop の待機中に後続の明示的 Restart が受理された場合、Stop は旧実行の cleanup 完了を待ち、後続要求は新実行を開始できます。
+
+StopReason は UserRequested / SettingsChanged / ApplicationShutdown / Disabled / Removed / Paused。Manual Restart の停止理由には UserRequested を使います。新しい run を開始すると現在の StopReason は null になります。
+
+ApplyConfigurationAsync は**明示的な再スタート API**です。設定の保存や Enabled/Pause の管理 API ではありません。Pause 中に保存だけ行う調整は将来の所有側で行います。
+
+### State machine
+
+| 状態 | 意味 |
+|---|---|
+| Stopped | 所有中の start/run/cleanup がなく、retry も pending ではない |
+| Starting | backend の開始処理を保留中 |
+| Running | 現世代の run を取得済みで、終了をまだ観測していない。接続・watch 準備・upload 成功は保証しない |
+| Restarting | 予期しない失敗後の backoff 中 |
+| Stopping | start のキャンセル結果回収、または run の cleanup 中。観測障害後の安全な cleanup にも使用 |
+| Error | non-retryable failure、retry 上限、または cleanup failure |
+
+基本遷移: `Stopped → Starting → Running`、`Running → Stopping → Restarting → Starting`、`Stop → Stopping → Stopped`。Phase 1 の exit result を受けた場合も DisposeAsync の完了を確認するため、一時的に Stopping を通ります。3回目の retry run が失敗した後は Error です。
+
+意図的停止理由のない終了は **exit code 0 でも非ゼロでも UnexpectedExit** です。Phase 1 の結果にある StopRequested は Session 自身の停止意図を上書きしません。
+
+### Retry and stable-run reset
+
+初回とは別に最大3回。**RetryCount は予約済み retry の番号を意味し、backoff 開始時点で増加**します。Phase 1 設計時の「再起動直前に消費」ではなく、Phase 2 の確定仕様に合わせた定義です。
+
+| 状況 | RetryCount | 次の開始まで |
+|---|---:|---:|
+| 初回失敗 | 1 | 2秒 |
+| retry 1 失敗 | 2 | 5秒 |
+| retry 2 失敗 | 3 | 10秒 |
+| retry 3 失敗 | 3 | Error。自動開始なし |
+
+Manual Restart、明示的な設定再適用、同一 run の30秒安定稼働で0に戻します。Stop や通常の Start だけでは count をリセットしません。手動再起動の開始自体が失敗した後も、backoff 中に再度 Manual Restart できます。
+
+Running 到達時の monotonic timestamp から30秒 timer を開始します。29秒ではリセットせず、30秒 timer のイベント時に現世代・Running・非停止中を確認し、monotonic elapsed time が30秒以上なら reset。run の再生成はしません。これは retry 制御上の生存条件であり、通信状態の確認ではありません。
+
+`UploadBackendException` の `BackendFailureKind.NonRetryable` は即 Error、Retryable とその他の開始例外は retry 対象です。大きな例外階層はありません。生存観測・出力読取の失敗は現在の run を停止・dispose してから retry します。
+
+### Serialization / generation / ownership
+
+状態変更は `Channel<Message>` の single-reader async event loop 一箇所だけで行います。Start/Stop/Restart、backend start 成功・失敗、exit、観測障害、retry/stable timer、activity、cleanup 完了を同じループで処理します。
+
+backend 呼出し・プロセス終了待機・Stop/Dispose は別 Task、timer は非同期 delay と完了イベントです。event loop はこれらを await せず、10秒 backoff や終了待機で停止しません。独自の UI thread blocking や `.Result` / `.Wait()` はありません。
+
+各 start attempt に単調増加する RunGeneration を割り当てます。start 成功/失敗、exit、観測失敗、activity、cleanup は実行 context と世代、retry/stable timer は世代と timer version を持ちます。現 context と一致しないイベントは状態を変更しません。timer version は同じ世代の Stop/Restart 中にも古い callback を拒否します。
+
+新 run を作る箇所は BeginStart 一箇所です。現 context は **開始要求が保留中でも、cleanup が保留中でも保持**します。Stop/Restart で start token をキャンセルしても、backend が無視して成功を返した場合はその run を引き取り、Running へ公開せず停止・dispose します。これが終わるまで次の世代を作りません。
+
+Stop はまず desired running を false、context を retired とし、その後 StopAsync を呼びます。したがって Stop 呼出しから即座に exit が返っても retry しません。受付側には短い lock と intent sequence の fence もあり、新しい Stop/Restart/Dispose がキューに入っている間、旧 timer event から backend 開始を予約しません。この lock 内で外部の開始処理を実行しません。
+
+cleanup は TreeExited と run.DisposeAsync 成功を確認して所有権を解放します。cleanup が不完全なら自動再試行はしません。終了・解放を確認できない run は Error のまま所有し続け、Start/Restart/設定再適用から新 run を生成しない quarantine とします。その Session の DisposeAsync も成功扱いにせず例外を返します。Error の LauncherPid はこの未確認の所有対象を示すことがあります。
+
+### Cancellation / disposal
+
+- Session lifetime、run context、retry delay、stable timer の CTS を分離します。
+- Stop/Restart は run context と timer をキャンセルします。cleanup へ caller token は渡しません。
+- 公開操作の caller cancellation は要求を撤回せず、caller の待機だけをキャンセルします。
+- Dispose 開始時点で新しい操作の受付を閉じます。Dispose 後の Start/Restart/Stop/設定再適用は ObjectDisposedException です。
+- Dispose は保留中 start の結果と cleanup を回収してから event loop を閉じ、追跡している全 background Task を await します。旧世代の遅れた observer も放棄しません。
+- worker は結果または安全な障害イベントを返します。完了済み worker は追跡表から除去し、長期間の retry で Task リストを増やし続けません。
+
+backend は開始失敗前の部分的な生成物を自身で cleanup する契約です。また、backend / IProcessRun / clock は呼出しを最終的に完了させる必要があります。協調しない backend を強制的に打ち切って新 run を重ねる機能はありません。安全な所有権を優先するため、そうした backend が永久に応答しなければ Session の Stop/Dispose も完了しません。Phase 1 実装は自身の有限 cleanup を持っています。
+
+### Fake backend / fake clock / tests
+
+追加ファイルは `tests/ImmichDesktopUploader.Tests/Sessions/` の3ファイルです。
+
+`FakeUploadBackend` は開始要求・設定・世代・token を記録し、成功/失敗/保留をテスト側で選びます。FakeProcessRun は PID、任意 exit code、Stop/Dispose の保留・失敗、遅れた exit、観測障害、出力を制御します。active run 数と最大同時数を記録し、各 fixture の終了時に **active = 0 / maximum <= 1** を検証します。
+
+`ISessionClock` の本番実装は .NET TimeProvider と Task.Delay を使用します。FakeSessionClock は仮想時刻を進めるだけで2/5/10/30秒を検証します。キャンセル後に遅れて完了する timer も再現します。テストの15秒 watchdog はデッドロック検出だけに使い、業務時間の待機には使いません。
+
+内部の mailbox fence と retired-generation work fence により、古い exit がまだ event loop に届いていない段階で「無視できた」と判定しません。公開 backend API をテスト専用に拡張していません。
+
+25テストグループで、ライフサイクル、Start/Stop/Restart 連打、0/非ゼロ終了、3回上限、29/30秒境界、旧 timer/exit、開始保留中の操作、設定の差替え、例外分類、cleanup failure、caller cancellation、Dispose と未完了 worker を検証しています。
+
+同じ `scripts/Test.ps1` が Phase 1 と Phase 2 の両方を実行します。Phase 2 に実 CLI upload やネットワーク回復処理はありません。
+
+### Phase 2 verified results (2026-09-12)
+
+| 検証 | 結果 |
+|---|---|
+| `dotnet build ImmichDesktopUploader.sln` | 成功、警告0・エラー0 |
+| `scripts/Test.ps1` — Phase 1 回帰 | 14成功。実 Immich CLI 3.2.0 の version/help・Job 所属・Stop 後の PID 消滅を含む |
+| `scripts/Test.ps1` — Phase 2 | 25成功、fake clock で業務時間を制御 |
+| 自動テスト合計 | **39成功、0失敗** |
+| `scripts/SmokeTest-WinUI.ps1` | 通常環境で起動・応答・閉じる・exit code 0 |
+
+テスト teardown は緊急の fake cleanup **より前**に active run 数と pending timer 数を検証します。Dispose のテストでは、run cleanup が Stopped に到達した後も、旧 observer が未完了なら Dispose が完了しないことを確認しています。
+
+Phase 1 の本体コードと scripts は無変更です。既存テストランナーには Phase 2 テスト呼出しを追加しただけです。NuGet / 実 launcher の検証はアクセス可能な実行環境で、WinUI smoke test は通常環境で実行しました。Phase 2 の未実行ゲートはありません。実画像アップロードはスコープ外なので行っていません。
+
 ## Next phase
 
-次に進める場合は、IProcessRun を使う UploadSession の状態遷移・RunGeneration・再試行を fake backend で実装する段階です。Phase 1 の作業では着手しません。
+次の候補は IUploadBackend に対する実 ImmichCliBackend と upload 引数構築です。UploadManager・保存・GUI・DPAPI・ConnectionMonitor・トレイ等には今回着手していません。
