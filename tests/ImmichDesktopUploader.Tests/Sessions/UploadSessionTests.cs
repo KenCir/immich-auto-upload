@@ -1,4 +1,6 @@
 using ImmichDesktopUploader.Application;
+using ImmichDesktopUploader.Infrastructure.Logging;
+using Microsoft.Extensions.Logging;
 
 namespace ImmichDesktopUploader.Tests.Sessions;
 
@@ -6,6 +8,34 @@ internal static class UploadSessionTests
 {
     public static async Task RunAllAsync(Func<string, Func<Task>, Task> test)
     {
+        await test("Session: short virtual-time stress with file logging preserves one run and drains timers", async () =>
+        {
+            var path = Path.Combine(Path.GetTempPath(), "ImmichSessionStress-" + Guid.NewGuid().ToString("N"));
+            await using var logging = new FileLogging(path);
+            await using var f = new Fixture(new AppDiagnostics(logging.Factory.CreateLogger("SessionStress")));
+            for (var i = 0; i < 100; i++)
+            {
+                var run = await f.StartRunning();
+                var before = f.Session.Snapshot;
+                for (var output = 0; output < 5; output++) run.Emit("synthetic stress output");
+                f.Clock.Advance(TimeSpan.FromSeconds(31));
+                await f.Session.SynchronizeAsync();
+                if (i % 10 == 0)
+                {
+                    await f.Session.RestartAsync();
+                    (await f.Backend.NextStartAsync()).Succeed(); await f.Running();
+                    Check(f.Session.Snapshot.RunGeneration > before.RunGeneration, "Restart did not advance generation.");
+                }
+                await f.Session.StopAsync();
+                Equal(UploadSessionStatus.Running, before.Status);
+                Equal(0, f.Backend.ActiveCount);
+            }
+            await f.Session.DisposeAsync();
+            Equal(110, f.Backend.StartCount); Equal(1, f.Backend.MaximumActiveCount);
+            Equal(0, f.Clock.PendingCount);
+            await logging.DisposeAsync();
+            Check(Directory.GetFiles(path, "*.log").Length > 0, "Stress did not persist diagnostics.");
+        });
         await test("Session: basic lifecycle / immutable snapshot / activity", async () =>
         {
             await using var f = new Fixture();
@@ -291,7 +321,7 @@ internal static class UploadSessionTests
         public UploadSessionConfiguration Configuration { get; } = new(Guid.NewGuid(), "test-folder");
         public UploadSession Session { get; }
         public bool ExpectDisposeFailure { get; init; }
-        public Fixture() => Session = new(Configuration, Backend, Clock);
+        public Fixture(AppDiagnostics? diagnostics = null) => Session = new(Configuration, Backend, Clock, diagnostics);
         public async Task<FakeProcessRun> StartRunning(FakeProcessRun? run = null)
         {
             await Session.StartAsync(); var call = await Backend.NextStartAsync();

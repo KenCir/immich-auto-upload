@@ -13,6 +13,7 @@ public sealed class UploadSession : IManagedUploadSession
     private static readonly TimeSpan StableDuration = TimeSpan.FromSeconds(30);
     private readonly IUploadBackend backend;
     private readonly ISessionClock clock;
+    private readonly AppDiagnostics? diagnostics;
     private readonly object ingress = new();
     private readonly Channel<Message> mailbox = Channel.CreateUnbounded<Message>(new() { SingleReader = true, AllowSynchronousContinuations = false });
     private readonly Channel<SessionSnapshot> changes = Channel.CreateBounded<SessionSnapshot>(new BoundedChannelOptions(64)
@@ -35,12 +36,13 @@ public sealed class UploadSession : IManagedUploadSession
     // Single consumer notification queue, not a broadcast event. Snapshot is authoritative.
     public ChannelReader<SessionSnapshot> Changes => changes.Reader;
 
-    public UploadSession(UploadSessionConfiguration configuration, IUploadBackend backend, ISessionClock? clock = null)
+    public UploadSession(UploadSessionConfiguration configuration, IUploadBackend backend, ISessionClock? clock = null, AppDiagnostics? diagnostics = null)
     {
         ValidateConfiguration(configuration);
         this.configuration = configuration;
         this.backend = backend ?? throw new ArgumentNullException(nameof(backend));
         this.clock = clock ?? new SessionClock();
+        this.diagnostics = diagnostics;
         snapshot = new(configuration.FolderId, UploadSessionStatus.Stopped, 0, null, 0, null, null, null, null);
         loop = Task.Run(EventLoopAsync);
     }
@@ -92,6 +94,7 @@ public sealed class UploadSession : IManagedUploadSession
         await Task.WhenAll(workers.Select(w => w.Task)).ConfigureAwait(false);
         lifetime.Dispose();
         changes.Writer.TryComplete();
+        diagnostics?.SessionEvent(AppEventKind.SessionDisposed, snapshot);
         if (!clean) throw new InvalidOperationException("Session cleanup could not be confirmed; no further runs are allowed.");
     }
 
@@ -143,6 +146,13 @@ public sealed class UploadSession : IManagedUploadSession
 
     private void HandleCommand(Command command)
     {
+        diagnostics?.SessionEvent(command.Kind switch
+        {
+            CommandKind.Start => AppEventKind.SessionStartRequested,
+            CommandKind.Stop => AppEventKind.SessionStopRequested,
+            CommandKind.Restart => AppEventKind.SessionManualRestart,
+            _ => AppEventKind.SessionConfigurationApplied
+        }, snapshot);
         appliedIntent = command.Intent;
         switch (command.Kind)
         {
@@ -225,7 +235,7 @@ public sealed class UploadSession : IManagedUploadSession
             catch (Exception error)
             {
                 var retryable = error is not UploadBackendException { FailureKind: BackendFailureKind.NonRetryable };
-                Post(new StartFailed(context, retryable));
+                Post(new StartFailed(context, retryable, (error as UploadBackendException)?.ErrorCode));
             }
         }));
     }
@@ -258,11 +268,19 @@ public sealed class UploadSession : IManagedUploadSession
         {
             try
             {
-                await foreach (var _ in message.Run.Output.ReadAllAsync(context.Cancellation.Token).ConfigureAwait(false))
+                await foreach (var output in message.Run.Output.ReadAllAsync(context.Cancellation.Token).ConfigureAwait(false))
+                {
+                    diagnostics?.Output(output, configuration.FolderId, context.Generation, message.Run.RootProcessId);
                     if (Interlocked.Exchange(ref context.ActivityQueued, 1) == 0) Post(new Activity(context));
+                }
             }
-            catch (OperationCanceledException) when (context.Cancellation.IsCancellationRequested) { }
-            catch { Post(new ObservationFailed(context, SessionErrorKind.OutputFailed)); }
+            catch (OperationCanceledException) when (context.Cancellation.IsCancellationRequested)
+            { diagnostics?.OutputCollectionInterrupted(configuration.FolderId, context.Generation, message.Run.RootProcessId); }
+            catch
+            {
+                diagnostics?.OutputCollectionInterrupted(configuration.FolderId, context.Generation, message.Run.RootProcessId);
+                Post(new ObservationFailed(context, SessionErrorKind.OutputFailed));
+            }
         }));
     }
 
@@ -276,7 +294,7 @@ public sealed class UploadSession : IManagedUploadSession
             Publish(snapshot with { Status = UploadSessionStatus.Stopped, LauncherPid = null });
             return;
         }
-        Fail(SessionErrorKind.StartFailed, message.Retryable);
+        Fail(SessionErrorKind.StartFailed, message.Retryable, backendCode: message.BackendCode);
     }
 
     private void Retire(SessionStopReason reason)
@@ -333,6 +351,7 @@ public sealed class UploadSession : IManagedUploadSession
             try { await context.Run!.DisposeAsync().ConfigureAwait(false); disposed = true; }
             catch { failed = true; }
             var confirmed = exit?.TreeExited == true && disposed;
+            if (exit is not null) diagnostics?.OutputLoss(configuration.FolderId, context.Generation, exit.DroppedOutputChunks, exit.OutputDrained);
             failed |= !confirmed || exit?.CleanupError is not null || exit?.OutputDrained != true;
             Post(new Cleaned(context, confirmed, failed, exit?.ExitCode));
         }));
@@ -349,7 +368,11 @@ public sealed class UploadSession : IManagedUploadSession
             restartInProgress = false;
             // A failed cleanup is never an automatic retry. Keep ownership if termination is unknown.
             if (message.TreeConfirmed) ReleaseCurrent();
-            else { context.Quarantined = true; context.Cancellation.Dispose(); }
+            else
+            {
+                context.Quarantined = true; context.Cancellation.Dispose();
+                diagnostics?.SessionEvent(AppEventKind.SessionQuarantined, snapshot);
+            }
             Publish(snapshot with { Status = UploadSessionStatus.Error, LauncherPid = message.TreeConfirmed ? null : context.Pid,
                 LastError = new(clock.UtcNow, SessionErrorKind.CleanupFailed, "Upload run cleanup could not be completed safely.", message.ExitCode), RetryExhausted = false });
             CompleteStopWaiters(false);
@@ -362,7 +385,7 @@ public sealed class UploadSession : IManagedUploadSession
         else Fail(failure?.Kind ?? SessionErrorKind.UnexpectedExit, true, failure?.ExitCode);
     }
 
-    private void Fail(SessionErrorKind kind, bool retryable, uint? exitCode = null)
+    private void Fail(SessionErrorKind kind, bool retryable, uint? exitCode = null, BackendErrorCode? backendCode = null)
     {
         restartInProgress = false; // A failed explicit attempt has ended; another manual restart is allowed.
         var error = new SessionError(clock.UtcNow, kind, kind switch
@@ -370,7 +393,7 @@ public sealed class UploadSession : IManagedUploadSession
             SessionErrorKind.StartFailed => "Upload backend start failed.",
             SessionErrorKind.UnexpectedExit => "Upload run exited unexpectedly.",
             _ => "Upload run observation failed."
-        }, exitCode);
+        }, exitCode, backendCode, retryable);
         if (!retryable || snapshot.RetryCount >= Backoffs.Length)
         {
             fatal = true;
@@ -415,7 +438,10 @@ public sealed class UploadSession : IManagedUploadSession
             if (current is not { Retired: false, CleanupStarted: false } context || snapshot.Status != UploadSessionStatus.Running) return;
             if (timer.Failed) { HandleObservationFailure(new(context, SessionErrorKind.ObservationFailed)); return; }
             if (clock.GetElapsedTime(context.StartedTimestamp) >= StableDuration)
+            {
                 Publish(snapshot with { RetryCount = 0 });
+                diagnostics?.SessionEvent(AppEventKind.SessionStableReset, snapshot);
+            }
         }
         else if (retryPending)
         {
@@ -444,6 +470,22 @@ public sealed class UploadSession : IManagedUploadSession
     private void Publish(SessionSnapshot value)
     {
         if (value == snapshot) return;
+        if (value.Status != snapshot.Status)
+        {
+            var kind = value.Status switch
+            {
+                UploadSessionStatus.Starting => value.RetryCount > 0 ? AppEventKind.SessionRetryStarted : AppEventKind.SessionStarting,
+                UploadSessionStatus.Running => AppEventKind.SessionRunning,
+                UploadSessionStatus.Restarting => AppEventKind.SessionRetryScheduled,
+                UploadSessionStatus.Stopping => AppEventKind.SessionStopping,
+                UploadSessionStatus.Stopped => AppEventKind.SessionStopped,
+                _ => value.RetryExhausted ? AppEventKind.SessionRetryExhausted :
+                    value.LastError?.Kind == SessionErrorKind.CleanupFailed ? AppEventKind.SessionCleanupFailed : AppEventKind.SessionFailed
+            };
+            diagnostics?.SessionEvent(kind, value);
+        }
+        if (value.LastError != snapshot.LastError && value.LastError?.Kind == SessionErrorKind.UnexpectedExit)
+            diagnostics?.SessionEvent(AppEventKind.SessionUnexpectedExit, value);
         Volatile.Write(ref snapshot, value);
         changes.Writer.TryWrite(value);
     }
@@ -510,7 +552,7 @@ public sealed class UploadSession : IManagedUploadSession
     private abstract record Message;
     private sealed record Command(CommandKind Kind, long Intent, SessionStopReason? Reason, UploadSessionConfiguration? Configuration, TaskCompletionSource Acknowledgement) : Message;
     private sealed record Started(RunContext Context, IProcessRun Run) : Message;
-    private sealed record StartFailed(RunContext Context, bool Retryable) : Message;
+    private sealed record StartFailed(RunContext Context, bool Retryable, BackendErrorCode? BackendCode = null) : Message;
     private sealed record Exited(RunContext Context, ProcessExitResult Result) : Message;
     private sealed record ObservationFailed(RunContext Context, SessionErrorKind Kind) : Message;
     private sealed record Cleaned(RunContext Context, bool TreeConfirmed, bool Failed, uint? ExitCode) : Message;

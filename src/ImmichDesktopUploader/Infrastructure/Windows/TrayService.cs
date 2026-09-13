@@ -11,22 +11,25 @@ public sealed class TrayService : ITrayService
     private readonly uint taskbarCreated;
     private NotifyData data;
     private bool disposed, paused, canPause, exiting;
+    private readonly AppDiagnostics? diagnostics;
     public event Action<TrayAction>? Invoked;
-    public TrayService(nint window)
+    public TrayService(nint window, AppDiagnostics? diagnostics = null)
     {
+        this.diagnostics = diagnostics;
         this.window = window; callback = WindowProc;
         taskbarCreated = RegisterWindowMessage("TaskbarCreated");
         data = new NotifyData { Size = (uint)Marshal.SizeOf<NotifyData>(), Window = window, Id = 1,
             Flags = 1 | 2 | 4 | 0x80, Callback = CallbackMessage, Icon = LoadIcon(0, (nint)32512), Tip = "Immich Desktop Uploader",
             Info = "", InfoTitle = "", Guid = Guid.Empty };
         if (!SetWindowSubclass(window, callback, 0x494d, 0)) throw new InvalidOperationException("Tray callback installation failed.");
+        diagnostics?.Emit(AppEventKind.TrayCreated);
     }
     public bool EnsureIcon()
     {
         if (disposed || exiting) return false;
         if (ShellNotifyIcon(1, ref data)) return true;
-        if (!ShellNotifyIcon(0, ref data)) return false;
-        data.Version = 4; ShellNotifyIcon(4, ref data); return true;
+        if (!ShellNotifyIcon(0, ref data)) { diagnostics?.Emit(AppEventKind.TrayFailed); return false; }
+        data.Version = 4; ShellNotifyIcon(4, ref data); diagnostics?.Emit(AppEventKind.TrayInitialized); return true;
     }
     public void Update(bool paused, bool canPause, bool exiting)
     { this.paused = paused; this.canPause = canPause; this.exiting = exiting; }
@@ -35,13 +38,19 @@ public sealed class TrayService : ITrayService
         try
         {
             if (message == taskbarCreated && !disposed && !exiting)
-            { if (!EnsureIcon()) Invoked?.Invoke(TrayAction.Unavailable); return 0; }
+            {
+                diagnostics?.Emit(AppEventKind.ExplorerRestartDetected);
+                if (!EnsureIcon()) Invoked?.Invoke(TrayAction.Unavailable);
+                else diagnostics?.Emit(AppEventKind.TrayReregistered);
+                return 0;
+            }
             if (message == 0x11) return 1; // WM_QUERYENDSESSION: never delay/veto Windows logoff.
             if (message == 0x16 && wParam != 0) { Invoked?.Invoke(TrayAction.SessionEnding); return 0; }
             if (message == CallbackMessage && !disposed)
             {
                 var notification = (uint)((long)lParam & 0xffff);
-                if (notification is 0x400 or 0x401 or 0x203) Invoked?.Invoke(TrayAction.Open);
+                if (notification is 0x400 or 0x401 or 0x203)
+                { diagnostics?.Emit(AppEventKind.TrayOpen); Invoked?.Invoke(TrayAction.Open); }
                 else if (notification is 0x7b or 0x205) ShowMenu();
                 return 0;
             }
@@ -60,6 +69,7 @@ public sealed class TrayService : ITrayService
             AppendMenu(menu, exiting ? 1u : 0, 3, "Exit");
             GetCursorPos(out var point); SetForegroundWindow(window);
             var command = TrackPopupMenuEx(menu, 0x100 | 0x2, point.X, point.Y, window, 0);
+            diagnostics?.Emit(command switch { 1 => AppEventKind.TrayOpen, 2 => AppEventKind.TrayPauseResume, 3 => AppEventKind.TrayExit, _ => AppEventKind.TrayMenuCancelled });
             PostMessage(window, 0, 0, 0);
             if (command != 0 && !exiting) Invoked?.Invoke(command switch { 1 => TrayAction.Open, 2 => TrayAction.PauseResume, _ => TrayAction.Exit });
         }

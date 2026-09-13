@@ -29,10 +29,10 @@ public sealed class AppCoordinator : IAsyncDisposable
         Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory = null, ISessionClock? probeClock = null)
     {
         this.settingsService = settingsService; this.credentialService = credentialService;
-        this.factory = factory ?? (c => new UploadSessionFactory(c)); this.diagnostics = diagnostics;
+        this.factory = factory ?? (c => new UploadSessionFactory(c, diagnostics)); this.diagnostics = diagnostics;
         // Existing isolated session-factory tests opt into probes explicitly; never contact
         // a server implicitly from a fake-runtime composition.
-        this.probeFactory = probeFactory ?? (factory is null ? c => new ImmichServerInfoProbe(c) : null);
+        this.probeFactory = probeFactory ?? (factory is null ? c => new ImmichServerInfoProbe(c, diagnostics: diagnostics, connectionGeneration: connectionGeneration) : null);
         this.probeClock = probeClock;
     }
 
@@ -43,6 +43,7 @@ public sealed class AppCoordinator : IAsyncDisposable
         if (!loaded.Success) throw new AppOperationException(loaded.Failure!.Value);
         var valid = SettingsValidation.Validate(loaded.Settings!).Settings;
         var credentials = await credentialService.LoadAsync(valid.ServerUrl).ConfigureAwait(false);
+        diagnostics?.RegisterSecret(credentials.ApiKey);
         Verify(valid, credentials);
         UploadManager replacement;
         lock (ingress)
@@ -67,6 +68,7 @@ public sealed class AppCoordinator : IAsyncDisposable
                 throw new AppOperationException(existing.Failure!.Value);
             // Validate credentials before making any write; never pair a new URL with an old key implicitly.
             var expected = newCredentials ?? await credentialService.LoadAsync(validated.ServerUrl).ConfigureAwait(false);
+            diagnostics?.RegisterSecret(expected.ApiKey);
             Verify(validated, expected);
             if (newCredentials is not null) await credentialService.SaveAsync(newCredentials).ConfigureAwait(false);
             await settingsService.SaveAsync(validated).ConfigureAwait(false);

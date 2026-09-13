@@ -7,7 +7,8 @@ public enum SessionStopReason { UserRequested, SettingsChanged, ApplicationShutd
 public enum SessionErrorKind { StartFailed, UnexpectedExit, ObservationFailed, OutputFailed, CleanupFailed }
 public enum BackendFailureKind { Retryable, NonRetryable }
 
-public sealed record SessionError(DateTimeOffset Timestamp, SessionErrorKind Kind, string Summary, uint? ExitCode = null);
+public sealed record SessionError(DateTimeOffset Timestamp, SessionErrorKind Kind, string Summary, uint? ExitCode = null,
+    BackendErrorCode? BackendCode = null, bool? Retryable = null);
 public sealed record SessionSnapshot(Guid FolderId, UploadSessionStatus Status, long RunGeneration,
     int? LauncherPid, int RetryCount, DateTimeOffset? LastStartedAt, DateTimeOffset? LastActivityAt,
     SessionError? LastError, SessionStopReason? StopReason, bool RetryExhausted = false);

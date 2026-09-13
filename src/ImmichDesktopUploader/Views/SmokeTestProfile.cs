@@ -38,9 +38,9 @@ internal static class SmokeTestProfile
         public void Write(string command) => value = command;
         public void Delete() => value = null;
     }
-    public static async Task<AppStoragePaths> CreateAsync(bool sampleFolders, bool ready = false)
+    public static async Task<AppStoragePaths> CreateAsync(bool sampleFolders, bool ready = false, AppStoragePaths? existingPaths = null)
     {
-        var paths = new AppStoragePaths(Path.Combine(Path.GetTempPath(), "ImmichGuiSmoke-" + Guid.NewGuid().ToString("N")));
+        var paths = existingPaths ?? new AppStoragePaths(Path.Combine(Path.GetTempPath(), "ImmichGuiSmoke-" + Guid.NewGuid().ToString("N")));
         if (sampleFolders)
             await new SettingsService(paths).SaveAsync(new AppSettings
             {

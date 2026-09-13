@@ -19,6 +19,8 @@ public interface IUploadSessionFactory
 public sealed class UploadSessionFactory : IUploadSessionFactory
 {
     private readonly IUploadBackend backend;
-    public UploadSessionFactory(ImmichConnectionSettings connection) => backend = new ImmichCliBackend(connection);
-    public IManagedUploadSession Create(UploadSessionConfiguration configuration) => new UploadSession(configuration, backend);
+    private readonly AppDiagnostics? diagnostics;
+    public UploadSessionFactory(ImmichConnectionSettings connection, AppDiagnostics? diagnostics = null)
+    { backend = new ImmichCliBackend(connection, applicationDiagnostics: diagnostics); this.diagnostics = diagnostics; }
+    public IManagedUploadSession Create(UploadSessionConfiguration configuration) => new UploadSession(configuration, backend, diagnostics: diagnostics);
 }

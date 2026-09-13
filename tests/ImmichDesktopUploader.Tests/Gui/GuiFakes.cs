@@ -43,6 +43,10 @@ internal sealed class QueuedDispatcher : IUiDispatcher
 }
 internal sealed class FakeDialogs : IDesktopDialogs
 {
+    public int OpenLogsCalls;
+    public DiagnosticSummary? DiagnosticSummary;
+    public Task OpenLogsFolderAsync() { OpenLogsCalls++; return Task.CompletedTask; }
+    public Task ShowDiagnosticsAsync(DiagnosticSummary summary) { DiagnosticSummary = summary; return Task.CompletedTask; }
     public string? Picked;
     public bool Confirm;
     public int Confirmations, PickerCalls, OpenCalls;

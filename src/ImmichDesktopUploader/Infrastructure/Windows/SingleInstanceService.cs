@@ -2,6 +2,7 @@
 using System.Runtime.InteropServices;
 using Microsoft.Windows.AppLifecycle;
 using Windows.ApplicationModel.Activation;
+using ImmichDesktopUploader.Application;
 
 namespace ImmichDesktopUploader.Infrastructure.Windows;
 
@@ -12,6 +13,15 @@ internal sealed class SingleInstanceService : IDisposable
     private readonly object sync = new();
     private Action? open;
     private bool pendingOpen, closing;
+    private AppDiagnostics? diagnostics;
+    public void AttachDiagnostics(AppDiagnostics value)
+    {
+        lock (sync)
+        {
+            diagnostics = value; diagnostics.Emit(AppEventKind.PrimaryInstance);
+            if (pendingOpen) diagnostics.Emit(AppEventKind.ActivationRedirected);
+        }
+    }
     public bool IsPrimary => instance.IsCurrent;
     public SingleInstanceService(string key)
     {
@@ -37,10 +47,11 @@ internal sealed class SingleInstanceService : IDisposable
     {
         var background = args.Data is ILaunchActivatedEventArgs launch &&
             launch.Arguments.Split(' ', StringSplitOptions.RemoveEmptyEntries).Contains("--background");
-        if (background) return;
+        if (background) { diagnostics?.Emit(AppEventKind.BackgroundActivation); return; }
         lock (sync)
         {
             if (closing) return;
+            diagnostics?.Emit(AppEventKind.ActivationRedirected);
             if (open is null) pendingOpen = true;
             else open();
         }

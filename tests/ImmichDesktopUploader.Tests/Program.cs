@@ -11,6 +11,15 @@ using ImmichDesktopUploader.Tests.Immich;
 if (!OperatingSystem.IsWindows()) { Console.Error.WriteLine("Windows integration tests require Windows."); return 2; }
 if (args.SequenceEqual(new[] { "--upload-e2e" })) return await SingleFolderE2E.RunAsync();
 if (args.SequenceEqual(new[] { "--connection-cli-check" })) return await ImmichDesktopUploader.Tests.Connections.RealCliVerification.RunAsync();
+if (args.Length == 2 && args[0] == "--configured-connection-check")
+    return await ImmichDesktopUploader.Tests.Logging.ProfileConnectionCheck.RunAsync(args[1]);
+if (args.Length == 2 && args[0] == "--configured-upload-check")
+    return await ImmichDesktopUploader.Tests.Logging.ProfileConnectionCheck.RunAsync(args[1], upload: true);
+if (args.Length == 3 && args[0] == "--configured-log-check")
+    return await ImmichDesktopUploader.Tests.Logging.ProfileConnectionCheck.RunAsync(args[1], existingLogs: args[2]);
+if (args.Length == 2 && args[0] == "--configured-network-e2e")
+    return await ImmichDesktopUploader.Tests.Connections.ConfiguredNetworkE2E.RunAsync(args[1]);
+if (args.Length != 0) { Console.Error.WriteLine("Unknown or incomplete test option; no test or upload started."); return 2; }
 var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
 var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
 var host = Path.Combine(root, "tests", "ProcessTestHost", "bin", configuration, "net10.0", "ProcessTestHost.exe");
@@ -246,6 +255,7 @@ await ImmichDesktopUploader.Tests.Connections.ConnectionMonitorTests.RunAllAsync
 await ImmichDesktopUploader.Tests.Connections.RecoveryTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Connections.CoordinatorConnectionTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Connections.SessionRecoveryTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Logging.FileLoggingTests.RunAllAsync(host, Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 

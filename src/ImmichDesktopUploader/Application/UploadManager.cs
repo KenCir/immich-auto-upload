@@ -74,6 +74,7 @@ public sealed class UploadManager : IAsyncDisposable
                 }
                 var changed = !SettingsValidation.SameRun(entry.Folder, folder);
                 var wasEnabled = entry.Folder.Enabled;
+                if (wasEnabled != folder.Enabled) diagnostics?.Emit(folder.Enabled ? AppEventKind.FolderEnabled : AppEventKind.FolderDisabled, folder.Id);
                 if (changed || wasEnabled != folder.Enabled)
                 {
                     InvalidateRecovery(entry, folder.Enabled ? RecoverySuppressionReason.SettingsChanged : RecoverySuppressionReason.Disabled);
@@ -117,6 +118,7 @@ public sealed class UploadManager : IAsyncDisposable
         if (!entry.Folder.Enabled || paused) throw new AppOperationException(AppFailure.DisabledOrPaused);
         CheckOpen();
         InvalidateRecovery(entry, RecoverySuppressionReason.UserStopped);
+        diagnostics?.Emit(AppEventKind.FolderRestart, folderId);
         entry.HoldError = false;
         running = true;
         if (entry.Dirty)
@@ -228,7 +230,9 @@ public sealed class UploadManager : IAsyncDisposable
             }
         }
         if (!connection.RecoveryEdge) return;
+        diagnostics?.ConnectionEvent(AppEventKind.RecoveryEdgeDetected, connection);
         consumedOutage = connection.OutageId;
+        diagnostics?.Emit(AppEventKind.RecoveryConsumed, generation: connectionGeneration);
         var candidates = sessions.Values.Where(e => e.Candidate is not null).Select(e => (Entry: e, Candidate: e.Candidate!)).ToArray();
         // Consume before any await. Pause/Resume never replays a past edge.
         foreach (var entry in sessions.Values) entry.Candidate = null;
@@ -318,6 +322,7 @@ public sealed class UploadManager : IAsyncDisposable
             return failed;
         })).ConfigureAwait(false);
         sessions.Clear(); Publish();
+        diagnostics?.Emit(AppEventKind.ManagerDisposed);
         if (failures.Any(f => f)) throw new AppOperationException(AppFailure.CleanupFailed);
     }
     private sealed class Entry(UploadFolderSettings folder, IManagedUploadSession session)

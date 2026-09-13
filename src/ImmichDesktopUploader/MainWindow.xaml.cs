@@ -7,6 +7,8 @@ using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
 using Windows.Storage.Pickers;
+using Microsoft.Extensions.Logging;
+using ImmichDesktopUploader.Infrastructure.Logging;
 
 namespace ImmichDesktopUploader;
 
@@ -19,20 +21,24 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
     private readonly Func<Task>? testExitCheckpoint;
     private bool closing, closeApproved;
     private ContentDialog? activeDialog;
-    public MainWindow(AppStoragePaths paths, bool smoke, Action shutdownFence, Func<Task>? testExitCheckpoint = null)
+    private readonly FileLogging logging;
+    private readonly ILogger logger;
+    public MainWindow(AppStoragePaths paths, bool smoke, Action shutdownFence, FileLogging logging, Func<Task>? testExitCheckpoint = null)
     {
         InitializeComponent(); this.paths = paths; this.shutdownFence = shutdownFence; this.testExitCheckpoint = testExitCheckpoint;
-        var diagnostics = new AppDiagnostics();
+        this.logging = logging; logger = logging.Factory.CreateLogger("Desktop");
+        var diagnostics = new AppDiagnostics(logging.Factory.CreateLogger("ApplicationEvents"), logging.Secrets.Register);
         model = new(new DesktopApplicationService(paths, diagnostics: diagnostics,
-            startup: new StartupService(Environment.ProcessPath!, smoke ? new SmokeTestProfile.StartupStore() : null),
+            startup: new StartupService(Environment.ProcessPath!, smoke ? new SmokeTestProfile.StartupStore() : null, diagnostics),
             probeFactory: smoke ? _ => new SmokeTestProfile.Probe(paths) : null,
-            probeClock: smoke ? new SmokeTestProfile.ProbeClock() : null), new QueueDispatcher(DispatcherQueue), this, diagnostics);
+            probeClock: smoke ? new SmokeTestProfile.ProbeClock() : null,
+            loggingStatus: () => new(logging.Health.FileUnavailable, logging.Health.DroppedEvents)), new QueueDispatcher(DispatcherQueue), this, diagnostics);
         Root.DataContext = model;
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1040, 820));
         AppWindow.Closing += OnClosing;
         ITrayService tray;
-        try { tray = new TrayService(WinRT.Interop.WindowNative.GetWindowHandle(this)); }
-        catch { tray = new UnavailableTrayService(); }
+        try { tray = new TrayService(WinRT.Interop.WindowNative.GetWindowHandle(this), diagnostics); }
+        catch { diagnostics.Emit(AppEventKind.TrayFailed); tray = new UnavailableTrayService(); }
         resident = new(this, tray, ShutdownAsync, () => model.PauseResumeCommand.ExecuteAsync());
         model.PropertyChanged += OnModelChanged;
     }
@@ -53,6 +59,7 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
     }
     private async Task ShutdownAsync()
     {
+        logger.LogInformation("{EventName}", "ShutdownStarted");
         var pendingSave = activeDialog switch { FolderEditorDialog f => f.PendingSave, SettingsDialog s => s.PendingSave, _ => Task.CompletedTask };
         activeDialog?.Hide();
         // Fence the application now, before waiting for an already accepted atomic save.
@@ -60,6 +67,8 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
         await pendingSave;
         await cleanup;
         if (testExitCheckpoint is not null) await testExitCheckpoint();
+        logger.LogInformation("{EventName}", "ShutdownCompleted");
+        await logging.DisposeAsync();
     }
     private async void OnExit(object sender, RoutedEventArgs args)
     {
@@ -71,11 +80,13 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
         AppWindow.Show();
         if (AppWindow.Presenter is OverlappedPresenter presenter && presenter.State == OverlappedPresenterState.Minimized) presenter.Restore();
         Activate(); TrayService.RestoreAndForeground(WinRT.Interop.WindowNative.GetWindowHandle(this));
+        logger.LogInformation("{EventName}", "WindowShown");
     }
-    public void Hide() => AppWindow.Hide();
+    public void Hide() { AppWindow.Hide(); logger.LogInformation("{EventName}", "WindowHidden"); }
     public void DisableInteraction()
     {
         closing = true; shutdownFence(); InteractionContainer.IsEnabled = false;
+        logger.LogInformation("{EventName}", "GracefulExitRequested");
         model.PropertyChanged -= OnModelChanged;
     }
     public void ReportLifetimeError(string safeMessage)
@@ -117,5 +128,24 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
         Directory.CreateDirectory(paths.DirectoryPath);
         var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(paths.DirectoryPath);
         await Windows.System.Launcher.LaunchFolderAsync(folder);
+    }
+    public async Task OpenLogsFolderAsync()
+    {
+        await Task.Run(() => Directory.CreateDirectory(logging.LogsPath));
+        var folder = await Windows.Storage.StorageFolder.GetFolderFromPathAsync(logging.LogsPath);
+        await Windows.System.Launcher.LaunchFolderAsync(folder);
+    }
+    public async Task ShowDiagnosticsAsync(DiagnosticSummary summary)
+    {
+        var text = $"App version: {summary.AppVersion}\nImmich CLI version (last observed): {summary.Cli.Version ?? "Not checked"}\n" +
+            $"Launcher: {summary.Cli.LauncherPath ?? "Not checked"}\nServer URL: {summary.ServerUrl}\n" +
+            $"Credentials configured: {summary.CredentialConfigured}\nFolders: {summary.Folders}\nRunning: {summary.RunningSessions}\n" +
+            $"Error sessions: {summary.ErrorSessions}\nPaused: {summary.Paused}\n{UiText.Connection(summary.Connection.Status)}\n" +
+            $"Last connection check: {summary.Connection.LastCheckedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "—"}\n" +
+            $"Logs: {summary.LogsPath}\nLogging unavailable: {summary.Logging.FileUnavailable}\nDropped log events: {summary.Logging.DroppedEvents}";
+        var content = new TextBlock { Text = text, TextWrapping = TextWrapping.Wrap, IsTextSelectionEnabled = true };
+        Microsoft.UI.Xaml.Automation.AutomationProperties.SetAutomationId(content, "DiagnosticSummary");
+        await ShowDialogAsync(new ContentDialog { XamlRoot = Root.XamlRoot, Title = "Diagnostics", CloseButtonText = "Close diagnostics",
+            Content = new ScrollViewer { Content = content, MaxHeight = 480 } });
     }
 }

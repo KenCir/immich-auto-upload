@@ -16,6 +16,7 @@ public sealed class CredentialService(AppStoragePaths paths, AppDiagnostics? dia
     private readonly SemaphoreSlim gate = new(1, 1);
     public async Task SaveAsync(ImmichConnectionSettings connection, CancellationToken token = default)
     {
+        diagnostics?.RegisterSecret(connection.ApiKey);
         if (!OperatingSystem.IsWindows()) throw new PlatformNotSupportedException();
         await gate.WaitAsync(token).ConfigureAwait(false);
         byte[]? plaintext = null;
@@ -27,7 +28,7 @@ public sealed class CredentialService(AppStoragePaths paths, AppDiagnostics? dia
             diagnostics?.Emit(AppEventKind.CredentialsSaved);
         }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException or CryptographicException)
-        { throw new AppOperationException(AppFailure.StorageFailure); }
+        { diagnostics?.Emit(AppEventKind.CredentialsSaveFailed, failure: AppFailure.StorageFailure); throw new AppOperationException(AppFailure.StorageFailure); }
         finally { if (plaintext is not null) CryptographicOperations.ZeroMemory(plaintext); gate.Release(); }
     }
 
@@ -44,17 +45,20 @@ public sealed class CredentialService(AppStoragePaths paths, AppDiagnostics? dia
             var payload = JsonSerializer.Deserialize<Payload>(plaintext);
             if (payload is null || payload.Version != 1) throw new AppOperationException(AppFailure.InvalidCredentials);
             var connection = new ImmichConnectionSettings(payload.ServerUrl, payload.ApiKey);
+            diagnostics?.RegisterSecret(connection.ApiKey);
             // Exact comparison after the common trailing-slash normalization is intentionally conservative.
             if (!StringComparer.Ordinal.Equals(expected, connection.ServerUrl)) throw new AppOperationException(AppFailure.CredentialMismatch);
             diagnostics?.Emit(AppEventKind.CredentialsLoaded);
             return connection;
         }
+        catch (AppOperationException error)
+        { diagnostics?.Emit(AppEventKind.CredentialsLoadFailed, failure: error.Failure); throw; }
         catch (Exception e) when (e is FileNotFoundException or DirectoryNotFoundException)
-        { throw new AppOperationException(AppFailure.MissingCredentials); }
+        { diagnostics?.Emit(AppEventKind.CredentialsLoadFailed, failure: AppFailure.MissingCredentials); throw new AppOperationException(AppFailure.MissingCredentials); }
         catch (Exception e) when (e is CryptographicException or JsonException or UploadBackendException)
-        { throw new AppOperationException(AppFailure.InvalidCredentials); }
+        { diagnostics?.Emit(AppEventKind.CredentialsLoadFailed, failure: AppFailure.InvalidCredentials); throw new AppOperationException(AppFailure.InvalidCredentials); }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        { throw new AppOperationException(AppFailure.StorageFailure); }
+        { diagnostics?.Emit(AppEventKind.CredentialsLoadFailed, failure: AppFailure.StorageFailure); throw new AppOperationException(AppFailure.StorageFailure); }
         finally { if (plaintext is not null) CryptographicOperations.ZeroMemory(plaintext); gate.Release(); }
     }
 

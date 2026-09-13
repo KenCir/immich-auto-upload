@@ -29,11 +29,18 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
     public bool CanRestore => state.CanRestoreBackup && !IsBusy;
     public string GlobalError { get => globalError; private set { if (Set(ref globalError, value)) Notify(nameof(HasGlobalError)); } }
     public bool HasGlobalError => GlobalError.Length != 0;
+    public bool HasCliError => state.Manager?.Folders.Any(folder => folder.Session.Status == UploadSessionStatus.Error &&
+        folder.Session.LastError?.BackendCode is BackendErrorCode.LauncherNotFound or BackendErrorCode.UnsupportedCli) == true;
+    public string CliError => "Immich CLI を利用できません。PATH と CLI のバージョンを確認し、該当フォルダの Restart を実行してください。";
     public AsyncCommand AddCommand { get; }
     public AsyncCommand SettingsCommand { get; }
     public AsyncCommand PauseResumeCommand { get; }
     public AsyncCommand RestoreCommand { get; }
     public AsyncCommand OpenFolderCommand { get; }
+    public AsyncCommand OpenLogsCommand { get; }
+    public AsyncCommand DiagnosticsCommand { get; }
+    public bool HasLoggingWarning => state.Diagnostics?.Logging is { FileUnavailable: true } or { DroppedEvents: > 0 };
+    public string LoggingWarning => "ログの保存失敗または欠落が発生しています。アップロードの操作は引き続き利用できます。";
 
     public MainViewModel(IDesktopApplication application, IUiDispatcher dispatcher, IDesktopDialogs dialogs, AppDiagnostics? diagnostics = null)
     {
@@ -63,6 +70,9 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
         { if (await dialogs.ConfirmRestoreAsync()) { await application.RestoreBackupAsync(); Apply(application.Snapshot); } }), ShowError,
             () => !disposed && CanRestore);
         OpenFolderCommand = new(() => dialogs.OpenSettingsFolderAsync(), ShowError, () => !disposed);
+        OpenLogsCommand = new(() => dialogs.OpenLogsFolderAsync(), ShowError, () => !disposed);
+        DiagnosticsCommand = new(() => state.Diagnostics is { } summary ? dialogs.ShowDiagnosticsAsync(summary) : Task.CompletedTask,
+            ShowError, () => !disposed && state.Diagnostics is not null);
         application.Changed += OnSnapshot;
         Apply(application.Snapshot);
     }
@@ -92,7 +102,7 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
             else if (Folders.IndexOf(row) != index) Folders.Move(Folders.IndexOf(row), index);
             row.Update(folder, next.Manager?.Folders.FirstOrDefault(f => f.Folder.Id == folder.Id)?.Session);
         }
-        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore), nameof(StartupText), nameof(ConnectionText), nameof(ConnectionCheckedText) }) Notify(property);
+        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore), nameof(StartupText), nameof(ConnectionText), nameof(ConnectionCheckedText), nameof(HasLoggingWarning), nameof(HasCliError) }) Notify(property);
         RefreshCommands();
     }
     private FolderEditorViewModel CreateEditor(UploadFolderSettings folder) => new(state.Settings!, folder, async replacement =>
@@ -128,10 +138,11 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
         try { await action(); }
         finally { IsBusy = false; }
     }
-    internal void ShowError(Exception error) { GlobalError = UiText.Error(error); diagnostics?.Emit(AppEventKind.UiActionFailed); }
+    internal void ShowError(Exception error) { GlobalError = UiText.Error(error); diagnostics?.Emit(AppEventKind.UiActionFailed); diagnostics?.UiFailure(error); }
     private void RefreshCommands()
     {
         AddCommand?.Refresh(); SettingsCommand?.Refresh(); PauseResumeCommand?.Refresh(); RestoreCommand?.Refresh(); OpenFolderCommand?.Refresh();
+        OpenLogsCommand?.Refresh(); DiagnosticsCommand?.Refresh();
         Notify(nameof(CanRestore)); foreach (var row in Folders) row.Refresh();
     }
     public ValueTask DisposeAsync()
@@ -157,10 +168,19 @@ public sealed class FolderViewModel : ObservableModel, IDisposable
     public string EnabledText => Enabled ? "Enabled" : "Disabled";
     public string ToggleLabel => Enabled ? "Disable" : "Enable";
     public string Album => "Album: " + (Settings.AlbumName ?? "—");
-    public string Status => UiText.Status(snapshot?.Status ?? UploadSessionStatus.Stopped);
+    public string Status => snapshot is { Status: UploadSessionStatus.Stopped, StopReason: SessionStopReason.Paused }
+        ? "Paused" : UiText.Status(snapshot?.Status ?? UploadSessionStatus.Stopped);
     public string Retry => "Retry: " + (snapshot?.RetryCount ?? 0);
     public string Activity => "Last activity: " + (snapshot?.LastActivityAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "—");
-    public string Error => snapshot?.LastError is null ? "" : (IsError ? "" : "Previous error: ") + snapshot.LastError.Summary;
+    public string Error => snapshot?.LastError is not { } error ? "" : (IsError ? "" : "Previous error: ") +
+        (error.BackendCode switch
+        {
+            BackendErrorCode.LauncherNotFound => "Immich CLI was not found on PATH. Install the CLI and restart this folder.",
+            BackendErrorCode.UnsupportedCli => "Immich CLI is incompatible. Check the CLI version and restart this folder.",
+            BackendErrorCode.InvalidFolder => "The upload folder is unavailable. Check its path and access permissions.",
+            _ => error.Summary
+        }) + (IsError && snapshot.RetryExhausted ? " Automatic retries are exhausted. Check the connection and use Restart." :
+            IsError && error.Retryable == false ? " Automatic retry is unavailable. Correct the configuration and use Restart." : "");
     public bool HasError => snapshot?.LastError is not null;
     public bool IsError => snapshot?.Status == UploadSessionStatus.Error;
     public AsyncCommand RestartCommand { get; }

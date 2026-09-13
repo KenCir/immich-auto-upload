@@ -36,9 +36,10 @@ public sealed class HkcuStartupStore(string subkey = @"Software\Microsoft\Window
 public sealed class StartupService : IStartupService
 {
     private readonly IStartupRegistryStore store;
+    private readonly AppDiagnostics? diagnostics;
     public string Command { get; }
-    public StartupService(string executablePath, IStartupRegistryStore? store = null)
-    { Command = BuildCommand(executablePath); this.store = store ?? new HkcuStartupStore(); }
+    public StartupService(string executablePath, IStartupRegistryStore? store = null, AppDiagnostics? diagnostics = null)
+    { Command = BuildCommand(executablePath); this.store = store ?? new HkcuStartupStore(); this.diagnostics = diagnostics; }
     public static string BuildCommand(string executablePath)
     {
         if (!Path.IsPathFullyQualified(executablePath) || executablePath.Contains('"') || executablePath.Any(char.IsControl) ||
@@ -64,7 +65,8 @@ public sealed class StartupService : IStartupService
         {
             if (desired) store.Write(Command); else store.Delete();
             if (!Inspect().Matches(desired)) throw new AppOperationException(AppFailure.StartupFailure);
+            diagnostics?.Emit(desired ? AppEventKind.StartupRegistered : AppEventKind.StartupUnregistered);
         }
-        catch { throw new AppOperationException(AppFailure.StartupFailure); }
+        catch { diagnostics?.Emit(AppEventKind.StartupFailed, failure: AppFailure.StartupFailure); throw new AppOperationException(AppFailure.StartupFailure); }
     }
 }

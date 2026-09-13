@@ -13,6 +13,48 @@ internal static class ViewModelTests
             new(f.Id, UploadSessionStatus.Running, 1, 123, 0, null, null, null, null), false))], []));
     public static async Task RunAllAsync(Func<string, Func<Task>, Task> test)
     {
+        await test("GUI: paused, exhausted retry and CLI configuration errors have actionable labels", async () =>
+        {
+            var app = new FakeDesktop(); var queue = new QueuedDispatcher(); var folder = P.Folder();
+            var state = State(1, folder); app.Publish(state);
+            await using var vm = new MainViewModel(app, queue, new FakeDialogs());
+            void Show(SessionSnapshot session)
+            {
+                state = state with { Sequence = state.Sequence + 1, Manager = state.Manager! with
+                    { Folders = [state.Manager!.Folders[0] with { Session = session }] } };
+                app.Publish(state); queue.Drain();
+            }
+            var snapshot = state.Manager!.Folders[0].Session;
+            Show(snapshot with { Status = UploadSessionStatus.Stopped, StopReason = SessionStopReason.Paused });
+            P.Equal("Paused", vm.Folders[0].Status);
+            Show(snapshot with { Status = UploadSessionStatus.Error, RetryExhausted = true,
+                LastError = new(DateTimeOffset.Now, SessionErrorKind.UnexpectedExit, "Upload run exited unexpectedly.", Retryable: true) });
+            P.Check(vm.Folders[0].Error.Contains("retries are exhausted"), "Retry exhaustion has no next action.");
+            Show(snapshot with { Status = UploadSessionStatus.Error,
+                LastError = new(DateTimeOffset.Now, SessionErrorKind.StartFailed, "Upload backend start failed.",
+                    BackendCode: BackendErrorCode.LauncherNotFound, Retryable: false) });
+            P.Check(vm.Folders[0].Error.Contains("PATH") && vm.Folders[0].Error.Contains("Automatic retry is unavailable"), "CLI configuration error is ambiguous.");
+            P.Check(vm.HasCliError && vm.CliError.Contains("Restart"), "Global CLI error is missing.");
+            Show(snapshot);
+            P.Check(!vm.HasCliError, "Recovered Session retains global CLI error.");
+        });
+        await test("GUI: diagnostic summary, log warning and Open logs commands respect shutdown", async () =>
+        {
+            var folder = P.Folder(); var state = State(1, folder) with { Connection = ConnectionSnapshot.Initial with { Status = ConnectionStatus.Unavailable } };
+            var summary = DiagnosticSummary.Create(state, new("3.2.0", "C:\\tools\\immich.cmd"), "C:\\test\\logs", new(true, 9));
+            state = state with { Diagnostics = summary };
+            var app = new FakeDesktop(); app.Publish(state); var dialogs = new FakeDialogs(); var queue = new QueuedDispatcher();
+            var vm = new MainViewModel(app, queue, dialogs);
+            await vm.DiagnosticsCommand.ExecuteAsync(); await vm.OpenLogsCommand.ExecuteAsync();
+            P.Equal(summary, dialogs.DiagnosticSummary); P.Equal(1, dialogs.OpenLogsCalls);
+            P.Equal(1, summary.Folders); P.Equal(1, summary.RunningSessions); P.Equal(0, summary.ErrorSessions);
+            P.Equal(P.Url, summary.ServerUrl); P.Equal(ConnectionStatus.Unavailable, summary.Connection.Status);
+            P.Check(vm.HasLoggingWarning && !vm.HasGlobalError, "Logging warning became upload failure.");
+            var json = JsonSerializer.Serialize(summary);
+            P.Check(!json.Contains("ApiKey", StringComparison.OrdinalIgnoreCase), "Diagnostic model exposes a credential field.");
+            await vm.DisposeAsync();
+            P.Check(!vm.DiagnosticsCommand.CanExecute(null) && !vm.OpenLogsCommand.CanExecute(null), "Exit left diagnostic UI operations enabled.");
+        });
         await test("GUI: connection check is independent of Running Session and rejects stale projection", async () =>
         {
             var app = new FakeDesktop(); var queue = new QueuedDispatcher(); var folder = P.Folder();

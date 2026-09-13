@@ -18,13 +18,15 @@ public sealed class ImmichCliBackend : IUploadBackend
     private readonly Channel<ImmichBackendDiagnostic> diagnostics = Channel.CreateBounded<ImmichBackendDiagnostic>(
         new BoundedChannelOptions(32) { FullMode = BoundedChannelFullMode.DropOldest, AllowSynchronousContinuations = false });
     private ImmichCliCapabilities? capabilities;
+    private readonly AppDiagnostics? applicationDiagnostics;
     public ChannelReader<ImmichBackendDiagnostic> Diagnostics => diagnostics.Reader;
 
     // An explicit launcher may be pinned by the owner; default always resolves PATH. No test-only runner.
-    public ImmichCliBackend(ImmichConnectionSettings connection, string? launcherPath = null)
+    public ImmichCliBackend(ImmichConnectionSettings connection, string? launcherPath = null, AppDiagnostics? applicationDiagnostics = null)
     {
         this.connection = connection ?? throw new ArgumentNullException(nameof(connection));
         this.launcherPath = launcherPath;
+        this.applicationDiagnostics = applicationDiagnostics;
     }
 
     public async Task<ImmichCliCapabilities> InitializeAsync(CancellationToken cancellationToken = default)
@@ -47,6 +49,7 @@ public sealed class ImmichCliBackend : IUploadBackend
             var version = (await ProbeAsync(launcher, ["--version"], cancellationToken).ConfigureAwait(false)).Trim();
             var help = await ProbeAsync(launcher, ["upload", "--help"], cancellationToken).ConfigureAwait(false);
             capabilities = ParseCapabilities(launcher, connection.Redact(version), help);
+            applicationDiagnostics?.CliObserved(capabilities.Version, connection.Redact(capabilities.LauncherPath));
             return capabilities;
         }
         finally { initialization.Release(); }
@@ -67,6 +70,8 @@ public sealed class ImmichCliBackend : IUploadBackend
         diagnostics.Writer.TryWrite(new(connection.Redact(cli.LauncherPath),
             "upload --watch [recursive/album/ignore/concurrency/progress options] -- <folder>",
             request.Configuration.FolderId, request.RunGeneration, run.RootProcessId));
+        applicationDiagnostics?.CliStarted(connection.Redact(cli.LauncherPath), "upload --watch [options] -- <folder>",
+            request.Configuration.FolderId, request.RunGeneration, run.RootProcessId);
         return run; // Ownership transfers to UploadSession; this backend never retries.
     }
 

@@ -61,15 +61,19 @@ public static class ResidentNative {
     try { accessible.DoDefaultAction((int)i+1); }
     catch(COMException e) {
      if(e.ErrorCode != unchecked((int)0x80020003)) throw;
-     // Some popup MSAA providers expose names but no default action. Use the verified
-     // item's native hit rectangle, targeting this test popup without moving the cursor.
-     Rect rect; if(!GetMenuItemRect(IntPtr.Zero,info.Menu,i,out rect)) return false;
-     var point=new Point { X=(rect.Left+rect.Right)/2, Y=(rect.Top+rect.Bottom)/2 };
-     if(!ScreenToClient(h,ref point)) return false;
-     var location=new IntPtr((point.Y << 16) | (point.X & 0xffff));
-     PostMessage(h,0x200,IntPtr.Zero,location);
-     PostMessage(h,0x201,new IntPtr(1),location);
-     PostMessage(h,0x202,IntPtr.Zero,location);
+     // Posted mouse selection intermittently cancelled without executing the command.
+     // Navigate the verified popup with keyboard
+     // messages instead; no global keyboard injection or user cursor movement.
+     PostMessage(h,0x100,new IntPtr(0x24),IntPtr.Zero); // Home
+     PostMessage(h,0x101,new IntPtr(0x24),IntPtr.Zero);
+     for(uint preceding=0; preceding<i; preceding++) {
+      uint precedingState=GetMenuState(info.Menu,preceding,0x400);
+      if((precedingState & (0x800 | 3))!=0) continue;
+      PostMessage(h,0x100,new IntPtr(0x28),IntPtr.Zero); // Down
+      PostMessage(h,0x101,new IntPtr(0x28),IntPtr.Zero);
+     }
+     PostMessage(h,0x100,new IntPtr(0x0d),IntPtr.Zero); // Enter
+     PostMessage(h,0x101,new IntPtr(0x0d),IntPtr.Zero);
     }
     finally { Marshal.ReleaseComObject(accessible); }
     return true;
@@ -121,6 +125,77 @@ function Invoke-ResidentChecks([string]$appPath) {
         $window = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
         Wait-Resident { (Get-Control $window 'ConnectionState').Current.Name -eq 'Connection check succeeded' } 'Connection check GUI missing'
         Wait-Resident { (Get-Control $window 'ManagerState').Current.Name -eq 'Running requested' } 'Ready manager missing'
+        Wait-Resident { (Get-Control $window 'DiagnosticsButton').Current.IsEnabled } 'Diagnostics not available'
+        (Get-Control $window 'DiagnosticsButton').GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        Wait-Resident { $null -ne (Get-Control $window 'DiagnosticSummary') } 'Diagnostic summary missing'
+        $diagnosticText = (Get-Control $window 'DiagnosticSummary').Current.Name
+        if ($diagnosticText -notlike '*App version:*' -or $diagnosticText -notlike '*Logs:*' -or $diagnosticText -like '*isolated-smoke-key*') { throw 'Incorrect or unsafe diagnostic summary' }
+        $diagnosticCloseCondition = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::NameProperty,'Close diagnostics')
+        $window.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$diagnosticCloseCondition).GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+        Wait-Resident { $null -eq (Get-Control $window 'DiagnosticSummary') } 'Diagnostics did not close'
+        # Exercise the actual GUI command and verify the Shell's resulting folder.
+        # Only close a newly created Explorer window owned by this isolated check.
+        $shell = New-Object -ComObject Shell.Application
+        $priorExplorerHandles = @($shell.Windows() | ForEach-Object { $_.HWND })
+        $expectedLogs = Join-Path $created[0].FullName 'logs'
+        $script:openedLogsWindow = $null
+        try {
+            (Get-Control $window 'OpenLogsButton').GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            Wait-Resident {
+                foreach ($explorerWindow in $shell.Windows()) {
+                    try {
+                        if ($explorerWindow.Document.Folder.Self.Path -eq $expectedLogs) {
+                            $script:openedLogsWindow = $explorerWindow
+                            return $true
+                        }
+                    } catch { }
+                }
+                return $false
+            } 'Open logs did not open the isolated logs folder in Explorer'
+            Write-Output 'PASS Logging: Open logs GUI command opened the exact folder in Explorer'
+        } finally {
+            if ($script:openedLogsWindow -and $script:openedLogsWindow.HWND -notin $priorExplorerHandles) {
+                $script:openedLogsWindow.Quit()
+            }
+            $script:openedLogsWindow = $null
+            [void][Runtime.InteropServices.Marshal]::ReleaseComObject($shell)
+        }
+        # Repeated real FolderPicker cancellation observes the reported native crash
+        # without selecting or registering any user photo folder.
+        for ($pickerAttempt = 0; $pickerAttempt -lt 3; $pickerAttempt++) {
+            Wait-Resident { (Get-Control $window 'AddFolderButton').Current.IsEnabled } 'Add folder remained busy'
+            (Get-Control $window 'AddFolderButton').GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+            $script:observedPicker = $null
+            try { Wait-Resident {
+                $byProcess = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ProcessIdProperty,$primary.Id)
+                foreach ($candidate in [System.Windows.Automation.AutomationElement]::RootElement.FindAll([System.Windows.Automation.TreeScope]::Children,$byProcess)) {
+                    if ($candidate.Current.ClassName -eq '#32770') { $script:observedPicker = $candidate; return $true }
+                    $byDialogClass = New-Object System.Windows.Automation.PropertyCondition([System.Windows.Automation.AutomationElement]::ClassNameProperty,'#32770')
+                    $childDialog = $candidate.FindFirst([System.Windows.Automation.TreeScope]::Descendants,$byDialogClass)
+                    if ($childDialog) { $script:observedPicker = $childDialog; return $true }
+                }
+                return $false
+            } 'Native FolderPicker did not appear' } catch {
+                Write-Output "Picker observation primary PID=$($primary.Id), exited=$($primary.HasExited)"
+                throw
+            }
+            $cancelPicker = Get-Control $script:observedPicker '2'
+            if (-not $cancelPicker) { throw 'FolderPicker Cancel button was not found' }
+            $cancelPattern = $null
+            if ($cancelPicker.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$cancelPattern)) {
+                $cancelPattern.Invoke()
+            } else {
+                # The native common dialog exposes IDCANCEL but may omit InvokePattern.
+                # Send its standard cancel command to the observed dialog only.
+                $pickerHandle = [IntPtr]$script:observedPicker.Current.NativeWindowHandle
+                if ($pickerHandle -eq [IntPtr]::Zero) { throw 'FolderPicker native handle missing' }
+                $null = [ResidentNative]::PostMessage($pickerHandle, 0x111, [IntPtr]2, [IntPtr]::Zero)
+            }
+            Wait-Resident { (Get-Control $window 'AddFolderButton').Current.IsEnabled } 'FolderPicker cancellation did not complete'
+            if ([ResidentNative]::Window($primary.Id) -ne $handle) { throw 'MainWindow changed after FolderPicker' }
+        }
+        $script:observedPicker = $null
+        Write-Output 'PASS Observation: FolderPicker opened/cancelled three times with the same MainWindow; no native crash observed'
         foreach ($desired in @($true,$false)) {
             Wait-Resident { (Get-Control $window 'SettingsButton').Current.IsEnabled } 'Settings operation still busy'
             (Get-Control $window 'SettingsButton').GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
@@ -170,6 +245,12 @@ function Invoke-ResidentChecks([string]$appPath) {
         Remove-Item -LiteralPath $hold
         if (-not $primary.WaitForExit(15000) -or $primary.ExitCode -ne 0) { throw 'Tray Exit failed' }
         if ([ResidentNative]::HasIcon($handle)) { throw 'Tray icon remained after Exit' }
+        $logFiles = @(Get-ChildItem -LiteralPath (Join-Path $created[0].FullName 'logs') -Filter '*.log')
+        $logEvents = @($logFiles | ForEach-Object { Get-Content -LiteralPath $_.FullName | ForEach-Object { ($_ | ConvertFrom-Json).Properties.EventName } })
+        foreach ($required in @('AppStarted','PrimaryInstance','TrayCreated','TrayPauseResume','WindowHidden','WindowShown','ShutdownCompleted')) {
+            if ($required -notin $logEvents) { throw "Missing flushed application event: $required" }
+        }
+        Write-Output 'PASS Logging: native Diagnostics view, application/tray events and shutdown flush'
         $probeAfterExit = Get-Content -LiteralPath $probeCountPath -Raw
         Start-Sleep -Milliseconds 500
         if ((Get-Content -LiteralPath $probeCountPath -Raw) -ne $probeAfterExit) { throw 'Probe continued after Exit' }

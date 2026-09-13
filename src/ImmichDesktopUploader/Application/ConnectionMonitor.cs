@@ -33,6 +33,7 @@ public sealed class ConnectionMonitor : IAsyncDisposable
             worker = RunAsync(worker, previousCancellation, probe, generation, cancellation.Token);
         }
         Notify(initial);
+        diagnostics?.ConnectionEvent(AppEventKind.ConnectionGenerationChanged, initial);
     }
 
     private async Task RunAsync(Task previous, CancellationTokenSource? previousCancellation,
@@ -50,7 +51,8 @@ public sealed class ConnectionMonitor : IAsyncDisposable
                 Publish(generation, checking: true);
                 diagnostics?.Emit(AppEventKind.ProbeStarted, generation: generation);
                 var (success, timedOut) = await ProbeAsync(probe, token).ConfigureAwait(false);
-                if (token.IsCancellationRequested) return;
+                if (token.IsCancellationRequested)
+                { diagnostics?.Emit(AppEventKind.StaleProbeIgnored, generation: generation); return; }
                 Publish(generation, checking: false, success, timedOut);
                 diagnostics?.Emit(timedOut ? AppEventKind.ProbeTimedOut : success ? AppEventKind.ProbeSucceeded : AppEventKind.ProbeFailed, generation: generation);
                 await clock.DelayAsync(TimeSpan.FromSeconds(30), token).ConfigureAwait(false);
@@ -97,7 +99,8 @@ public sealed class ConnectionMonitor : IAsyncDisposable
         ConnectionSnapshot next;
         lock (gate)
         {
-            if (closing || snapshot.ConnectionGeneration != generation) return;
+            if (closing || snapshot.ConnectionGeneration != generation)
+            { diagnostics?.Emit(AppEventKind.StaleProbeIgnored, generation: generation); return; }
             if (checking) next = snapshot with { Status = ConnectionStatus.Checking, RecoveryEdge = false, Sequence = ++sequence };
             else
             {
@@ -115,8 +118,8 @@ public sealed class ConnectionMonitor : IAsyncDisposable
                     OutageStartedAt = !success && !wasUnavailable ? now : snapshot.OutageStartedAt,
                     RecoveryEdge = success && wasUnavailable
                 };
-                if (status != snapshot.LastCompletedStatus) diagnostics?.Emit(AppEventKind.ConnectionChanged, generation: generation);
             }
+            if (next.Status != snapshot.Status) diagnostics?.ConnectionEvent(AppEventKind.ConnectionChanged, next);
             Volatile.Write(ref snapshot, next);
         }
         Notify(next);

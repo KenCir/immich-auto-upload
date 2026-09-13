@@ -26,7 +26,8 @@ public sealed class SettingsService(AppStoragePaths paths, AppDiagnostics? diagn
         {
             var primary = await ReadAsync(paths.SettingsPath, token).ConfigureAwait(false);
             var backup = primary.Success ? null : (await ReadAsync(paths.BackupPath, token).ConfigureAwait(false)).Settings;
-            diagnostics?.Emit(AppEventKind.SettingsLoaded, failure: primary.Failure);
+            diagnostics?.Emit(primary.Success ? AppEventKind.SettingsLoaded : AppEventKind.SettingsLoadFailed, failure: primary.Failure);
+            if (backup is not null) diagnostics?.Emit(AppEventKind.SettingsBackupAvailable);
             return primary with { RecoveryCandidate = backup };
         }
         finally { gate.Release(); }
@@ -34,7 +35,10 @@ public sealed class SettingsService(AppStoragePaths paths, AppDiagnostics? diagn
 
     public async Task SaveAsync(AppSettings settings, CancellationToken token = default)
     {
-        var validated = SettingsValidation.Validate(settings).Settings;
+        AppSettings validated;
+        try { validated = SettingsValidation.Validate(settings).Settings; }
+        catch (AppOperationException error)
+        { diagnostics?.Emit(AppEventKind.SettingsValidationFailed, failure: error.Failure); throw; }
         await gate.WaitAsync(token).ConfigureAwait(false);
         try
         {
@@ -47,8 +51,10 @@ public sealed class SettingsService(AppStoragePaths paths, AppDiagnostics? diagn
                 existing.Success ? paths.BackupPath : null, token).ConfigureAwait(false);
             diagnostics?.Emit(AppEventKind.SettingsSaved);
         }
+        catch (AppOperationException error)
+        { diagnostics?.Emit(AppEventKind.SettingsSaveFailed, failure: error.Failure); throw; }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        { throw new AppOperationException(AppFailure.StorageFailure); }
+        { diagnostics?.Emit(AppEventKind.SettingsSaveFailed, failure: AppFailure.StorageFailure); throw new AppOperationException(AppFailure.StorageFailure); }
         finally { gate.Release(); }
     }
 
@@ -69,8 +75,10 @@ public sealed class SettingsService(AppStoragePaths paths, AppDiagnostics? diagn
                 paths.SettingsPath + ".rejected-" + Guid.NewGuid().ToString("N"), token).ConfigureAwait(false);
             diagnostics?.Emit(AppEventKind.SettingsRecovered);
         }
+        catch (AppOperationException error)
+        { diagnostics?.Emit(AppEventKind.SettingsRecoveryFailed, failure: error.Failure); throw; }
         catch (Exception e) when (e is IOException or UnauthorizedAccessException)
-        { throw new AppOperationException(AppFailure.StorageFailure); }
+        { diagnostics?.Emit(AppEventKind.SettingsRecoveryFailed, failure: AppFailure.StorageFailure); throw new AppOperationException(AppFailure.StorageFailure); }
         finally { gate.Release(); }
     }
 

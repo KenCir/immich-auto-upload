@@ -46,6 +46,8 @@ public interface IDesktopDialogs
     Task<bool> ConfirmRemoveAsync(string name);
     Task<bool> ConfirmRestoreAsync();
     Task OpenSettingsFolderAsync();
+    Task OpenLogsFolderAsync();
+    Task ShowDiagnosticsAsync(DiagnosticSummary summary);
 }
 
 public static class UiText

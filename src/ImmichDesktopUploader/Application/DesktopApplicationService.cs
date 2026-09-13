@@ -5,7 +5,7 @@ namespace ImmichDesktopUploader.Application;
 
 public sealed record DesktopSnapshot(long Sequence, AppSettings? Settings, bool CredentialsConfigured,
     bool CanRestoreBackup, AppFailure? Failure, UploadManagerSnapshot? Manager, StartupRegistration? Startup = null,
-    ConnectionSnapshot? Connection = null);
+    ConnectionSnapshot? Connection = null, DiagnosticSummary? Diagnostics = null);
 
 public interface IDesktopApplication : IAsyncDisposable
 {
@@ -34,14 +34,20 @@ public sealed class DesktopApplicationService : IDesktopApplication
     private Task? poller, disposal;
     private bool closing;
     private long sequence;
+    private readonly AppDiagnostics? diagnostics;
+    private readonly string logsPath;
+    private readonly Func<LoggingStatus>? loggingStatus;
     private DesktopSnapshot snapshot = new(0, null, false, false, null, null);
     public DesktopSnapshot Snapshot => Volatile.Read(ref snapshot);
     public event Action<DesktopSnapshot>? Changed;
 
     public DesktopApplicationService(AppStoragePaths paths,
         Func<ImmichConnectionSettings, IUploadSessionFactory>? factory = null, AppDiagnostics? diagnostics = null, IStartupService? startup = null,
-        Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory = null, ISessionClock? probeClock = null)
+        Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory = null, ISessionClock? probeClock = null,
+        Func<LoggingStatus>? loggingStatus = null)
     {
+        this.diagnostics = diagnostics; this.loggingStatus = loggingStatus;
+        logsPath = Path.Combine(paths.DirectoryPath, "logs");
         settings = new(paths, diagnostics);
         credentials = new(paths, diagnostics);
         coordinator = new(settings, credentials, factory, diagnostics, probeFactory, probeClock);
@@ -107,6 +113,9 @@ public sealed class DesktopApplicationService : IDesktopApplication
     private void Publish(AppSettings? current, bool credentials, bool recovery, AppFailure? failure)
     {
         var next = new DesktopSnapshot(++sequence, current, credentials, recovery, failure, coordinator.Snapshot, startup?.Inspect(), coordinator.Connection);
+        if (next.Startup is { } registration && (registration != Snapshot.Startup || current?.StartWithWindows != Snapshot.Settings?.StartWithWindows))
+            diagnostics?.StartupState(registration, current?.StartWithWindows ?? false);
+        next = next with { Diagnostics = DiagnosticSummary.Create(next, diagnostics?.Cli ?? new(), logsPath, loggingStatus?.Invoke() ?? new()) };
         Volatile.Write(ref snapshot, next);
         Changed?.Invoke(next);
     }
