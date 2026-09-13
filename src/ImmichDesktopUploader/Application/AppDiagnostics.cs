@@ -2,7 +2,8 @@ using System.Threading.Channels;
 namespace ImmichDesktopUploader.Application;
 
 public enum AppEventKind { SettingsLoaded, SettingsSaved, SettingsRecovered, CredentialsLoaded, CredentialsSaved,
-    SessionAdded, SessionRemoved, SessionChanged, Paused, Resumed, ManagerStarted, ManagerStopped, ConsistencyFailure }
+    SessionAdded, SessionRemoved, SessionChanged, Paused, Resumed, ManagerStarted, ManagerStopped, ConsistencyFailure,
+    UiFolderAdded, UiFolderEdited, UiFolderRemoved, UiRestart, UiPauseResume, UiSettingsSaved, UiSettingsSaveFailed, UiActionFailed, UiInitializationFailed }
 public sealed record AppDiagnostic(AppEventKind Kind, Guid? FolderId = null, AppFailure? Failure = null);
 public sealed class AppDiagnostics
 {

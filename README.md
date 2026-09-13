@@ -1,8 +1,8 @@
-# Immich Desktop Uploader — Phase 1–4
+# Immich Desktop Uploader — Phase 1–5
 
-Windows 11 / x64 向け。プロセス基盤、単一UploadSession、ImmichCliBackendに加えて、Phase 4の **設定保存 / DPAPI / UploadManager / AppCoordinator** を実装しています。WinUI は最小ウィンドウのままです。
+Windows 11 / x64 向け。プロセス基盤、設定保存、DPAPI、UploadManagerに加え、Phase 5の **WinUI GUI / ViewModel連携** を実装しています。Settingsから接続情報を保存し、フォルダ追加・編集・無効化・再起動を操作できます。
 
-Applicationサービスは実行可能ですが、GUIへの接続、トレイ、自動起動、ConnectionMonitorは未実装です。通常テストで実アップロードは行わず、手動E2E入口を分離しています。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
+通常起動では保存済み設定・資格情報を読み、有効なフォルダを開始します。window closeはCLI cleanup後にapp exitです。トレイ、自動起動、ConnectionMonitorは未実装です。通常テストは隔離データを使い、実アップロードを行いません。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
 
 ## Build / run
 
@@ -584,4 +584,108 @@ Phase 3テスト1件は、終了直後のEXE mappingによる共有違反を避�
 
 変更はUploadSessionのinterface宣言、ImmichConnectionSettingsのURL検証共通化と内部比較、DPAPIパッケージ参照、既存テスト入口、Phase 3のテスト準備1件、本READMEです。Phase 1のプロセス基盤とPhase 2の状態機械は維持しました。コミットは実行していません。
 
-次の推奨フェーズは、これらのApplicationサービスを利用するGUIの設定編集・フォルダ一覧です。今回GUI、tray、HKCU Run、自動起動、ConnectionMonitor、server-info pollingには着手していません。
+Phase 4時点ではGUI連携は次の候補でした。現在の実装は以下のPhase 5を参照してください。
+
+## Phase 5: WinUI GUI / ViewModel Integration
+
+### Architecture / ownership
+
+```text
+MainWindow / FolderEditorDialog / SettingsDialog
+  → MainViewModel / FolderViewModel / editor drafts / AsyncCommand
+  → IDesktopApplication / DesktopApplicationService
+  → AppCoordinator / UploadManager
+  → UploadSession / ImmichCliBackend
+```
+
+MVVMは追加パッケージを使わず、INotifyPropertyChangedとICommandの最小実装です。observable properties、async commandのbusy/CanExecute、draft validation、snapshot projectionを分けました。ViewModelはSessionを直接操作せず、Application層の窓口だけを使用します。
+
+DesktopApplicationServiceがSettingsService・CredentialService・AppCoordinatorの寿命をまとめます。MainViewModelがこの窓口を所有し、MainWindowのcloseからDisposeします。MainWindow.xaml.csにはwindow lifecycle、dialog表示、FolderPickerのHWND bridge、DispatcherQueue bridge、設定フォルダを開くUI処理だけを置いています。設定検証、JSON書込み、UploadSessionの操作は置いていません。
+
+### Main view / operations
+
+Main画面にはServer URL、Credentials configured / missing、Managerの実行要求・Pause状態、global error、フォルダ一覧を表示します。Connected/Disconnectedという接続状態は表示しません。RunningはCLIプロセスの稼働状態で、サーバー接続やupload成功の保証ではありません。
+
+各行はEnabled/Disabled、パス末尾の表示名、Path、Album、Status、Retry、Last activity、安全なLastErrorを表示します。状態名の変換はUiText.Statusに集約しました。Error状態のLastErrorはError InfoBar、Running復帰後の残存エラーはPrevious errorとしてInformational表示です。
+
+- Add folder: Windows FolderPickerで選択後、Folder Editorを開きます。Pickerキャンセルでは保存しません。
+- Edit: Path、Enabled、Recursive、AlbumName、IgnorePatterns、Concurrencyをdraftで編集します。Path変更でもFolderIdを維持します。
+- Enable/Disable: AppCoordinatorの保存・差分適用を通します。Disabledなら該当Sessionを停止し、他フォルダは再起動しません。
+- Restart: 指定FolderIdだけへ依頼します。Errorからの手動再試行にも使えます。Disabled/Pause中や起動・再起動・停止処理中は無効です。
+- Remove: 確認dialogの承認後、設定から対象だけを外します。ローカル画像・Immich assetsは削除しないと明示します。
+- Pause All / Resume All: Enabledを変更せずPhase 4のAPIへ委譲します。Pause前からErrorだったSessionはResumeでは再試行しません。
+
+FolderPickerには[WinUI desktop向けInitializeWithWindow](https://learn.microsoft.com/en-us/windows/apps/develop/ui/display-ui-objects)でowner HWNDを設定します。ContentDialogは同じwindowのXamlRootを使用します。MainWindowは標準Border/Card、Button、InfoBar、ProgressRing、ListViewとsystem themeを使います。
+
+### Draft validation / credentials UX
+
+Save前はruntimeへ反映しません。保存はvalidation → persist → reload/consistency → runtime applyの既存順序です。保存失敗ならdialogを閉じず、入力draftを保持して修正可能なメッセージを表示します。
+
+Concurrencyは数値用InputScopeの入力欄で、1以上のInt32だけを許可します。Application層の検証も維持します。exact duplicate pathは保存不可、親子overlapは関連パスを警告表示して保存を許可します。パスの存在確認は実行時のbackendにも残っています。
+
+IgnorePatternsは1行1パターンです。CRLF/LF/CRを分割し、空行・空白だけの行を除外しますが、残すパターンの前後空白はtrimしません。AlbumNameも有効な文字を含む値の前後空白を保持します。Phase 3の複数glob/CMD文字の制約は引き続き適用されます。
+
+SettingsのAPI KeyはPasswordBoxで更新時だけ入力します。保存済みキーを復号して画面に戻す処理はありません。ViewModelにも公開のキーpropertyを設けず、入力bridgeは書込み専用です。
+
+- 空欄は既存キーを維持します。削除機能は今回追加していません。
+- Server URL変更時、または資格情報が未設定・利用不可の場合は新キーを必須にします。
+- Save成功またはdialogを閉じると入力キー参照を解放し、PasswordBoxを空にします。Save失敗時は再入力を避けるためdraft内に保持します。
+- Start with Windowsは保存済み値を表示するdisabled controlで、Available in a later phaseと明記しています。
+- 内部例外、stack trace、ProcessStartSpecificationをUIへ表示しません。
+
+### Snapshot synchronization / lifetime / errors
+
+DesktopApplicationServiceは500ms周期で**メモリ上の**Manager snapshotを読みます。ネットワークpollingやserver-infoではありません。各発行に単調増加Sequenceを付け、MainViewModelは[DispatcherQueue.TryEnqueue](https://learn.microsoft.com/en-us/windows/apps/develop/performance/keep-ui-thread-responsive)でUI threadへmarshalしてObservableCollectionへ投影します。受理済みSequence以下を破棄するので、古いsnapshotがSave後の状態や削除後の一覧を上書きしません。
+
+MainViewModelだけが通知を購読し、行ViewModelはSessionを購読しません。削除時に行のcommandを無効化し、MainViewModel Disposeで通知を解除します。既にenqueueされたcallbackもdisposedを確認して破棄します。Applicationのpolling taskはキャンセル・awaitしてからCoordinatorをDisposeします。
+
+global IsBusy、行のRestart/Remove command busy、dialog Save busyで重複実行を防ぎます。Save中はeditor内容を無効化します。UIにWait()/Resultはありません。操作エラーは次の操作まで表示し、周期snapshotですぐ消しません。
+
+初期化失敗でもwindowは表示し、自動アップロード未開始と修正方法を提示します。有効なbackup候補がある場合だけRestore backupを表示します。Restoreには確認があり、復旧後に資格情報を再確認してEnabledフォルダを開始します。未対応schemaではRestoreを表示せず、Open settings folderから確認できます。
+
+window closeでは終了を一度キャンセルし、開いているdialogを閉じて進行中Saveを待ち、MainViewModel → DesktopApplicationService → AppCoordinator → Manager → SessionのDisposeをawaitした後に閉じます。cleanup失敗時は成功扱いで終了せず、windowにエラーを表示します。trayへの最小化はありません。
+
+UiFolderAdded/Edited/Removed、UiRestart、UiPauseResume、UiSettingsSaved/SaveFailed、UiActionFailed、UiInitializationFailedを固定enumの診断境界へ流せます。キーや入力値は含めず、完全なfile loggerは追加していません。
+
+### Tests / verified results (2026-09-13)
+
+| 検証 | 結果 |
+|---|---|
+| solution build | 成功、警告0・エラー0 |
+| Phase 1–4 regression | 75成功 |
+| Phase 5 | 12成功（ViewModel/command/draft 9、Application bridge/lifetime 3） |
+| `scripts/Test.ps1` 合計 | **87成功、0失敗** |
+| WinUI smoke | 隔離したfirst-runと2フォルダ表示の両方でMainView/Settings PasswordBox/終了を確認 |
+| 実プロセスcleanup | ViewModelからのDisposeで実Job treeのPID消滅を確認 |
+| Phase 3 E2E入口 | ビルド・起動成功、`Immich upload E2E: skipped / Reason: E2E credentials not provided` |
+
+ViewModelテストは初期/空/複数行、background更新のUI queue経由反映、逆順配送のstale破棄、行削除・購読解除、Pause/Resume、初期化エラー、Remove確認、Restart対象、重複command抑止を検証します。draftテストは初期値・Id維持・全編集項目・改行分割・重複/overlap・数値不正・保存失敗保持・キー秘匿・URL変更ルールを検証します。
+
+Application bridgeは実filesystem/DPAPIを使い、初回設定からの開始、保存失敗時のruntime維持、Disable、backup recoveryを検証します。native lifetimeテストはProcessTestHostだけを実行し、実写真や実サーバーを使いません。
+
+smoke testはWindows標準UI Automationを使用し、MainViewの要素と実際のbinding、2つのdisabled sample folder card、Settings dialogのPasswordBoxを検査します。dialogを開いたままwindow closeしてexit code 0を確認します。`--smoke-test` / `--smoke-test-folders` は毎回新しい一時profileを使い、個人設定を読みません。サンプルは資格情報なし・Disabledなので実uploadは起動しません。FolderPickerの選択操作や実サーバーuploadの自動UIテストは含めません。
+
+### Manual GUI E2E
+
+既存VRChat/写真フォルダを使わず、空の専用テストフォルダを新規作成して行ってください。通常GUI起動には上記Build/runのexeを使用し、smoke-test引数は付けません。
+
+1. Settingsを開き、正しいServer URLと新API Keyを入力してSaveします。Credentials configuredを確認します。
+2. 新しい空の専用フォルダ（例: `C:\Temp\ImmichDesktopUploader-GUI-E2E-<任意の新しい名前>`）を用意します。
+3. Add folderのPickerでそのフォルダだけを選びます。
+4. Folder EditorでEnabled=true、Recursive=true、AlbumName=`ImmichDesktopUploader-GUI-E2E`、Concurrency=2としてSaveします。
+5. 行のRunningを確認します。これはupload成功の確認ではありません。
+6. uploadしてよいテスト画像1枚だけをコピーします。CLIのwatch待ち時間も考慮し、Immich画面で画像とalbum所属を確認します。
+7. Editでalbum等を変更し、同じフォルダ行の設定が更新されることを確認できます。複数の専用テストフォルダを使う場合は、他の行が再起動されないことも確認できます。
+8. Disableを押してStoppedを確認します。Task Managerでも対象launcher/Nodeが終了したことを確認します。
+9. 必要ならRemove確認で登録を外します。ローカル画像とサーバー画像は残ります。
+10. windowを閉じ、アプリと管理CLIが残らないことを確認します。
+
+今回実施したのは自動テストと隔離GUI smokeです。実サーバーを使うGUI E2E、FolderPickerの対話選択、実画像uploadは未実施です。Phase 3のUpload-E2E.ps1と実行コードは変更していません。
+
+### Files / limitations / next phase
+
+追加: `Application/DesktopApplicationService.cs`、`ViewModels/Mvvm.cs` / `MainViewModel.cs` / `Editors.cs`、`Views/FolderEditorDialog.*` / `SettingsDialog.*` / `UiBridges.cs` / `SmokeTestProfile.cs`、`tests/ImmichDesktopUploader.Tests/Gui/`。
+
+変更: App/MainWindowのXAMLとcode-behind、AppDiagnosticsのUIイベント、net10.0テストターゲットからUIコードを除外するcsproj、テスト入口、SmokeTest-WinUI.ps1、本README。既存のSettings/DPAPI/Manager/Session/process動作は変更していません。コミットは実行していません。
+
+状態反映には最大約500msの遅延があります。ディスク上の設定を外部編集した場合の自動reload、接続状態監視、toast、tray、Windows自動起動はありません。保存後のプロセスcleanup失敗まで全runtimeをrollbackするtransactionはPhase 4同様にありません。次の候補はtrayとwindow lifetimeの拡張ですが、今回その実装には進んでいません。

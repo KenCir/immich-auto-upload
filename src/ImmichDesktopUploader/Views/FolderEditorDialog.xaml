@@ -1,0 +1,16 @@
+<ContentDialog x:Class="ImmichDesktopUploader.Views.FolderEditorDialog"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="Upload folder" PrimaryButtonText="Save" CloseButtonText="Cancel" DefaultButton="Primary" PrimaryButtonClick="OnSave">
+ <ScrollViewer MaxHeight="600"><ContentControl IsEnabled="{Binding CanEdit}"><StackPanel Spacing="12" Width="440">
+  <TextBox Header="Folder path" Text="{Binding Path, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+  <Button Content="Browse…" Command="{Binding BrowseCommand}"/>
+  <CheckBox Content="Enabled" IsChecked="{Binding Enabled, Mode=TwoWay}"/>
+  <CheckBox Content="Recursive" IsChecked="{Binding Recursive, Mode=TwoWay}"/>
+  <TextBox Header="Album name (optional)" Text="{Binding AlbumName, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+  <TextBox Header="Ignore patterns — 1 line = 1 pattern" Text="{Binding IgnoreText, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" AcceptsReturn="True" TextWrapping="Wrap" MinHeight="90"/>
+  <TextBox Header="Concurrency (1 or more)" Text="{Binding Concurrency, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"><TextBox.InputScope><InputScope><InputScope.Names><InputScopeName NameValue="Number"/></InputScope.Names></InputScope></TextBox.InputScope></TextBox>
+  <TextBlock Text="{Binding Warning}" TextWrapping="Wrap" Foreground="{ThemeResource SystemFillColorCautionBrush}"/>
+  <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{ThemeResource SystemFillColorCriticalBrush}"/>
+  <ProgressRing IsActive="{Binding SaveCommand.IsBusy}" Width="24" Height="24"/>
+ </StackPanel></ContentControl></ScrollViewer>
+</ContentDialog>
