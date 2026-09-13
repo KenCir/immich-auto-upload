@@ -13,6 +13,21 @@ internal static class ViewModelTests
             new(f.Id, UploadSessionStatus.Running, 1, 123, 0, null, null, null, null), false))], []));
     public static async Task RunAllAsync(Func<string, Func<Task>, Task> test)
     {
+        await test("GUI: connection check is independent of Running Session and rejects stale projection", async () =>
+        {
+            var app = new FakeDesktop(); var queue = new QueuedDispatcher(); var folder = P.Folder();
+            app.Publish(State(1, folder)); await using var vm = new MainViewModel(app, queue, new FakeDialogs());
+            P.Equal("Not checked", vm.ConnectionText);
+            var connection = ConnectionSnapshot.Initial with { Status = ConnectionStatus.Unavailable,
+                LastCheckedAt = DateTimeOffset.UnixEpoch, ConnectionGeneration = 1 };
+            app.Publish(State(2, folder) with { Connection = connection }); queue.Drain();
+            P.Equal("Connection check failed", vm.ConnectionText);
+            P.Check(vm.ConnectionCheckedText.Contains("1970-01-01"), "Last check missing.");
+            P.Equal("Running", vm.Folders[0].Status);
+            app.Publish(State(3, folder) with { Connection = connection with { Status = ConnectionStatus.Checking } });
+            app.Publish(State(4, folder) with { Connection = connection with { Status = ConnectionStatus.Reachable } });
+            queue.Drain(reverse: true); P.Equal("Connection check succeeded", vm.ConnectionText);
+        });
         await test("GUI: initial zero/multiple projection and centralized status/previous error", async () =>
         {
             var app = new FakeDesktop(); app.Publish(State(1)); var queue = new QueuedDispatcher();

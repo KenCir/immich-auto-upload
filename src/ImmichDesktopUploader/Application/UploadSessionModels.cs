@@ -10,7 +10,7 @@ public enum BackendFailureKind { Retryable, NonRetryable }
 public sealed record SessionError(DateTimeOffset Timestamp, SessionErrorKind Kind, string Summary, uint? ExitCode = null);
 public sealed record SessionSnapshot(Guid FolderId, UploadSessionStatus Status, long RunGeneration,
     int? LauncherPid, int RetryCount, DateTimeOffset? LastStartedAt, DateTimeOffset? LastActivityAt,
-    SessionError? LastError, SessionStopReason? StopReason);
+    SessionError? LastError, SessionStopReason? StopReason, bool RetryExhausted = false);
 
 // Immutable upload inputs only; no credentials, UI state or persisted settings.
 public sealed record UploadSessionConfiguration(Guid FolderId, string Path)

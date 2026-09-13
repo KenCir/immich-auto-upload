@@ -39,6 +39,20 @@ internal static class ImmichFixture
             if (scenario == "no-progress") help = help.Replace("--no-progress", "--unsupported");
             Console.WriteLine(help); return 0;
         }
+        if (args.SequenceEqual(new[] { "server-info" }))
+        {
+            if (scenario == "probe-pending")
+            {
+                var start = new System.Diagnostics.ProcessStartInfo(Environment.ProcessPath!) { UseShellExecute = false };
+                start.ArgumentList.Add("forever");
+                using var descendant = System.Diagnostics.Process.Start(start)!;
+                if (capture is not null) await File.WriteAllTextAsync(capture + ".child", descendant.Id.ToString());
+                await Task.Delay(Timeout.Infinite);
+            }
+            Console.WriteLine("Synthetic server information");
+            Console.Error.WriteLine("Synthetic private diagnostic");
+            return scenario == "probe-fail" ? 17 : 0;
+        }
         if (args.ElementAtOrDefault(0) != "upload" || !args.Contains("--watch")) return 2;
         if (scenario == "exit") return 17;
         Console.WriteLine($"PID:{Environment.ProcessId}"); Console.Out.Flush();

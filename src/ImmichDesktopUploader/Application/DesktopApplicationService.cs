@@ -4,7 +4,8 @@ using ImmichDesktopUploader.Infrastructure.Persistence;
 namespace ImmichDesktopUploader.Application;
 
 public sealed record DesktopSnapshot(long Sequence, AppSettings? Settings, bool CredentialsConfigured,
-    bool CanRestoreBackup, AppFailure? Failure, UploadManagerSnapshot? Manager, StartupRegistration? Startup = null);
+    bool CanRestoreBackup, AppFailure? Failure, UploadManagerSnapshot? Manager, StartupRegistration? Startup = null,
+    ConnectionSnapshot? Connection = null);
 
 public interface IDesktopApplication : IAsyncDisposable
 {
@@ -38,11 +39,12 @@ public sealed class DesktopApplicationService : IDesktopApplication
     public event Action<DesktopSnapshot>? Changed;
 
     public DesktopApplicationService(AppStoragePaths paths,
-        Func<ImmichConnectionSettings, IUploadSessionFactory>? factory = null, AppDiagnostics? diagnostics = null, IStartupService? startup = null)
+        Func<ImmichConnectionSettings, IUploadSessionFactory>? factory = null, AppDiagnostics? diagnostics = null, IStartupService? startup = null,
+        Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory = null, ISessionClock? probeClock = null)
     {
         settings = new(paths, diagnostics);
         credentials = new(paths, diagnostics);
-        coordinator = new(settings, credentials, factory, diagnostics);
+        coordinator = new(settings, credentials, factory, diagnostics, probeFactory, probeClock);
         this.startup = startup;
     }
 
@@ -104,7 +106,7 @@ public sealed class DesktopApplicationService : IDesktopApplication
     }
     private void Publish(AppSettings? current, bool credentials, bool recovery, AppFailure? failure)
     {
-        var next = new DesktopSnapshot(++sequence, current, credentials, recovery, failure, coordinator.Snapshot, startup?.Inspect());
+        var next = new DesktopSnapshot(++sequence, current, credentials, recovery, failure, coordinator.Snapshot, startup?.Inspect(), coordinator.Connection);
         Volatile.Write(ref snapshot, next);
         Changed?.Invoke(next);
     }

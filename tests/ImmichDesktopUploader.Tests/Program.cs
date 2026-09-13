@@ -10,6 +10,7 @@ using ImmichDesktopUploader.Tests.Immich;
 
 if (!OperatingSystem.IsWindows()) { Console.Error.WriteLine("Windows integration tests require Windows."); return 2; }
 if (args.SequenceEqual(new[] { "--upload-e2e" })) return await SingleFolderE2E.RunAsync();
+if (args.SequenceEqual(new[] { "--connection-cli-check" })) return await ImmichDesktopUploader.Tests.Connections.RealCliVerification.RunAsync();
 var root = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "../../../../../"));
 var configuration = new DirectoryInfo(AppContext.BaseDirectory).Parent!.Name;
 var host = Path.Combine(root, "tests", "ProcessTestHost", "bin", configuration, "net10.0", "ProcessTestHost.exe");
@@ -241,6 +242,10 @@ await ImmichDesktopUploader.Tests.Management.CoordinatorTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Gui.ViewModelTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Gui.DesktopServiceTests.RunAllAsync(host, Test);
 await ImmichDesktopUploader.Tests.Residency.ResidentTests.RunAllAsync(host, Test);
+await ImmichDesktopUploader.Tests.Connections.ConnectionMonitorTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Connections.RecoveryTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Connections.CoordinatorConnectionTests.RunAllAsync(Test);
+await ImmichDesktopUploader.Tests.Connections.SessionRecoveryTests.RunAllAsync(Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 

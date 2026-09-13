@@ -19,6 +19,51 @@ internal static class ImmichBackendTests
 
     public static async Task RunAllAsync(string host, Func<string, Func<Task>, Task> test)
     {
+        await test("Connection production probe: exact server-info arguments, environment isolation and nonzero exit", async () =>
+        {
+            using var f = new Fixture(host, "probe-success");
+            using var env = new ScopedEnvironment(new() { ["IMMICH_WATCH"] = "true", ["IMMICH_API_KEY"] = "inherited-secret", ["IMMICH_INSTANCE_URL"] = "https://wrong.invalid" });
+            var probe = new ImmichServerInfoProbe(Connection(), f.Launcher);
+            Check(await probe.CheckAsync(default), "Successful server-info failed.");
+            var call = f.Calls().Single();
+            Sequence(new[] { "server-info" }, call.Arguments);
+            Sequence(new[] { "IMMICH_API_KEY", "IMMICH_INSTANCE_URL" }, call.EnvNames);
+            Equal(Connection().ServerUrl, call.Server);
+            Equal(Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(Key))), call.KeyHash);
+            AssertGone([call.Pid]);
+            f.SetScenario("probe-fail");
+            Check(!await probe.CheckAsync(default), "Nonzero exit was successful.");
+            AssertGone(f.Calls().Select(c => c.Pid));
+        });
+        await test("Connection production probe: cancellation awaits process cleanup", async () =>
+        {
+            using var f = new Fixture(host, "probe-pending");
+            using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+            var work = new ImmichServerInfoProbe(Connection(), f.Launcher).CheckAsync(cancellation.Token);
+            try
+            {
+                var deadline = Stopwatch.StartNew();
+                while ((!File.Exists(f.Capture + ".child") || new FileInfo(f.Capture + ".child").Length == 0) && deadline.Elapsed < TimeSpan.FromSeconds(5))
+                    await Task.Delay(10);
+                Check(File.Exists(f.Capture + ".child"), "Probe child never launched.");
+            }
+            finally { cancellation.Cancel(); }
+            try { await work; } catch (OperationCanceledException) { }
+            AssertGone(f.Calls().Select(c => c.Pid));
+            AssertGone([int.Parse(await File.ReadAllTextAsync(f.Capture + ".child"))]);
+        });
+        await test("Connection production monitor: ten-second timeout cleans actual launcher and descendant tree", async () =>
+        {
+            using var f = new Fixture(host, "probe-pending"); var clock = new FakeSessionClock();
+            await using var monitor = new ConnectionMonitor(clock);
+            monitor.Configure(new ImmichServerInfoProbe(Connection(), f.Launcher), 1);
+            await Connections.ConnectionMonitorTests.Until(() => File.Exists(f.Capture + ".child") && new FileInfo(f.Capture + ".child").Length > 0);
+            var child = int.Parse(await File.ReadAllTextAsync(f.Capture + ".child"));
+            clock.Advance(TimeSpan.FromSeconds(10));
+            await Connections.ConnectionMonitorTests.Until(() => monitor.Snapshot.Status == ConnectionStatus.Unavailable);
+            Equal("Connection check timed out.", monitor.Snapshot.LastErrorSummary);
+            AssertGone(f.Calls().Select(c => c.Pid).Append(child));
+        });
         await test("Immich: immutable upload defaults and connection redaction", () =>
         {
             var config = new UploadSessionConfiguration(Guid.NewGuid(), "folder");

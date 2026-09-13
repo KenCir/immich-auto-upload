@@ -27,10 +27,14 @@ internal static class ResidentTests
             FakeProcessRun? first = null;
             try
             {
-                await service.InitializeAsync(); first = (await backend.NextStartAsync()).Succeed();
-                var second = (await backend.NextStartAsync()).Succeed();
+                await service.InitializeAsync();
+                var call1 = await backend.NextStartAsync(); var call2 = await backend.NextStartAsync();
+                // Independent session actors need not reach the backend in folder order.
+                first = (call1.Request.Configuration.FolderId == a.Id ? call1 : call2).Succeed();
+                var second = (call1.Request.Configuration.FolderId == b.Id ? call1 : call2).Succeed();
                 await Until(() => factory.Sessions.Values.All(s => s.Snapshot.Status == UploadSessionStatus.Running));
-                first.HoldStop = true; var save = service.SaveAsync(Settings(b)); await first.StopEntered.Task;
+                first.HoldStop = true; var save = service.SaveAsync(Settings(b));
+                await first.StopEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 second.Exit(17); await Until(() => clock.Delays.Any(d => d.Duration == TimeSpan.FromSeconds(2)));
                 var lifetime = new ResidentLifetime(new WindowFake(), new TrayFake(), () => service.DisposeAsync().AsTask(), service.PauseAsync);
                 var exit = lifetime.ExitAsync(); clock.Advance(TimeSpan.FromSeconds(2));

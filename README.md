@@ -1,6 +1,6 @@
 # Immich Desktop Uploader — Phase 1–6
 
-Windows 11 / x64 向け。プロセス基盤、設定保存、DPAPI、UploadManager、WinUI GUIに加え、Phase 6の **Tray / single-instance / Windows自動起動** を実装しています。Settingsから接続情報と自動起動を保存し、フォルダ追加・編集・無効化・再起動を操作できます。
+Windows 11 / x64 向け。プロセス基盤、設定保存、DPAPI、UploadManager、WinUI GUI、Tray / single-instance / Windows自動起動に加え、Phase 7の **接続確認と接続回復時の再開** を実装しています。Settingsから接続情報と自動起動を保存し、フォルダ追加・編集・無効化・再起動を操作できます。
 
 通常起動では保存済み設定・資格情報を読み、有効なフォルダを開始します。**×はウィンドウを隠すだけで、CLIは継続します。終了はTrayのExitまたはExit applicationです。** `--background` は通常ウィンドウを表示せず常駐します。ConnectionMonitor・ネットワーク復旧・通知・最終file loggerは未実装です。通常テストは隔離データを使い、実アップロードを行いません。API直接呼出し・FileSystemWatcher・CLI/Node自動インストールは行いません。
 
@@ -795,4 +795,91 @@ cleanupを確認できない場合は成功扱いで終了せず、windowにエ�
 2. icon消滅、app終了、記録したlauncher/Node/CLIの全PID消滅を確認する。
 3. 保存中・Restart中にもExitを試し、次回起動でsettingsが読み込めることを確認する。
 
-Phase 6ではConnectionMonitor、server-info定期実行、接続回復によるError Session再開、retry変更、backend変更、Windows通知、最終file loggerは追加していません。これらの次Phaseには自動的に進みません。コミットは行っていません。
+上記はPhase 6完了時点の記録です。Phase 7の変更と検証は以下を参照してください。
+
+## Phase 7: ConnectionMonitor / Network Recovery
+
+### 接続確認とプロセスの所有
+
+AppCoordinatorがprimary instanceのlifetimeに対してConnectionMonitorを1個所有します。monitorはUploadSessionを所有せず、immutableなConnectionSnapshotを発行します。UploadManagerが既存の直列操作キューで回復候補の登録・破棄・再開判断を行います。
+
+ConnectionSnapshotのStatusはUnknown / Checking / Reachable / Unavailableです。LastCheckedAt、LastSucceededAt、LastFailureAt、ConnectionGenerationと固定文面のLastErrorSummaryを持ちます。Checking中も前回の完了状態と障害期間を保持します。API Key、生stderr、CLIの人間向け診断文はsnapshotに含めません。
+
+productionのImmichServerInfoProbeはPATH上の既存launcher解決とWindowsProcessRunnerを使い、正式な`immich server-info`を実行します。既存のenvironment isolationで継承した`IMMICH_*`を除去し、アプリ管理のURL / API Keyだけを環境変数に設定します。秘密を引数に入れません。stdout / stderrは読み捨ててdrainし、既存Job Objectでprocess treeを管理します。upload backendとCLI起動方式は変更していません。
+
+ローカルのsettings / credentials検証後、Enabled Session開始と初回probeを進めます。**初回server-info失敗をSession開始の前提条件にしません。** ローカル設定・資格情報のfatal errorは既存AppCoordinatorのエラー表示に残し、接続確認失敗とは区別します。
+
+### 間隔・タイムアウト・世代
+
+- 初回は即時開始。以後は前回のprobeとcleanupが完了してから30秒待機します。固定周期の重複timerは使いません。
+- 10秒の期限でprobeをcancelし、process cleanup完了を待ってUnavailableにします。cancel後の処理を投げ捨てません。
+- URL / API Key変更でConnectionGenerationを増加し、旧probeをcancelします。世代をまたぐworker chainが旧cleanupを待つため、同時probeは最大1件です。
+- 古い世代のsuccess / failure / timeoutは現在のsnapshotと回復処理へ反映しません。短時間に複数回設定を変更すると、中間の未開始世代をskipします。
+- cleanupを確認できない場合は次のprobeを起動せず、Unavailableとcleanupエラーを保持します。Disposeも失敗を返し、安全に終了したと偽って処理を継続しません。
+- Check nowは追加していません。
+
+### 回復候補とretryの関係
+
+**既存UploadSessionの2秒 / 5秒 / 10秒、最大3回retry、30秒stable resetは変更していません。** Sessionに追加したのは、terminal Errorがretry exhaustionによるものかを示すsnapshot情報です。RetryCountが3でもNonRetryableだった場合は候補にしません。
+
+候補にはFolderId、接続世代、フォルダ設定世代、障害期間ID、RunGeneration、失敗時刻を保持します。Enabled、Running requested、not paused、非quarantineで、Unavailable期間中にruntime/retry failureによるErrorへ達したSessionだけが対象です。ユーザー停止理由、local / NonRetryable error、cleanup failureは除外します。
+
+候補は接続状態通知で照合し、回復edgeを処理する直前にも照合します。これにより、probe間でErrorになったSessionを取りこぼさず、障害開始前や回復判定後のErrorを混ぜません。候補表示はSession Error発生と同時とは限らず、次の接続状態通知時に更新されます。
+
+Unavailable → Reachableでのみ候補をsnapshot化し、await前に消費します。現在のEnabled / pause / stop / shutdown意図、設定世代、RunGeneration、Error状態を確認し、既存RestartAsyncでRetryCountを0にして新しい開始機会を与えます。その後は再び通常のretryです。
+
+同じ障害期間のedgeは再使用できず、通知sequenceが古い場合も無視します。Reachableが続いても再起動しません。次の障害期間でも、その期間に新たな対象failureが必要です。Reachable中にErrorとなったSessionを、後からネットワークが一往復しただけで再開しません。
+
+**CLIが生存してRunningの場合、接続確認が失敗してもStop / Restartしません。** Restarting / Starting中にも二重Startを行いません。CLI自身の継続動作に任せます。
+
+### 操作とshutdownによる抑止
+
+- Pauseで候補を破棄します。Pause中の回復edgeは保存せず破棄し、Resume後に再生しません。Resumeは既存のEnabled開始・Error保持ルールに従います。
+- Disable / Remove / Stopで候補を破棄します。Remove後のcallbackがフォルダを再作成することはありません。
+- フォルダ実行設定変更で候補を無効化し、設定世代と無効化時のRunGenerationを更新します。古いrunのErrorを同じ設定の新しい候補として再利用しません。
+- URL / API Key変更では旧managerの全候補を破棄し、新接続世代で監視を開始します。旧Session cleanupが失敗したら新managerを作りません。
+- Exit fenceが新しい操作・候補・回復処理を拒否し、monitor cancelとmanager shutdownを開始します。進行中probeのcleanup、全Session / CLI tree cleanup、受理済み操作の完了を待ってから既存のTray削除・application exitへ進みます。
+
+### GUI / Tray / background
+
+MainWindowは接続確認をNot checked / Checking… / Connection check succeeded / Connection check failedと最終確認日時で表示します。「Connected」やupload成功とは表示しません。SessionのRunningとConnection check failedは同時に表示される正常な組み合わせです。
+
+×によるHide、Tray Open、Pause/Resume、HKCU Run、AppInstance redirectのlifetimeは維持しています。hidden / `--background`中もmonitorは継続し、probe結果だけでwindowを表示しません。secondaryは既存ProgramのAppInstance判定でredirectして終了し、XAML / AppCoordinator / UploadManager / ConnectionMonitorを初期化しません。
+
+probe start / success / failure / timeout / state transition、candidate registered / discarded、recovery attempt / suppressedと固定理由コードは既存AppDiagnosticsのbounded channelへ発行できます。最終file loggerやWindows通知は追加していません。
+
+### Phase 7検証（2026-09-13）
+
+| 検証 | 結果・範囲 |
+|---|---|
+| solution build | 警告0、エラー0 |
+| Phase 1〜6回帰 | 既存100件成功。並行Sessionテストの開始順依存をFolderId照合に修正 |
+| Phase 7追加 | 25件成功。fake probe / fake clock、世代切替、候補と抑止、実Session retry、実process cleanup、GUI projection |
+| 全console tests | **125成功、0失敗** |
+| scheduling | 即時初回、完了後30秒、10秒timeout、旧cleanup待機、連続世代切替、Dispose待機をfake clockで確認 |
+| recovery | Errorからの一度だけの再開、retry reset、再度2/5/10、Running維持、Pause / Disable / Remove / settings / Exit抑止を確認 |
+| WinUI / Tray | 通常起動、非表示中の反復probe、GUI状態、Open / Pause / Resume / Exit、終了後probe停止を確認 |
+| single-instance | background / normal secondary、同時起動、Exit中redirect。一時profileがprimaryの1個だけであることを確認 |
+| Explorer restart相当 | 対象test icon削除後のTaskbarCreated再登録を確認。ユーザーのExplorer自体は再起動しない |
+| production probe | 正確なserver-info引数、2つだけの環境変数、成功 / nonzero、cancel / timeout後の実子process消滅を確認 |
+| 実CLI 3.2.0 | production runnerでserver-infoを閉じたloopback endpointへ実行。失敗終了とcleanup完了を確認 |
+
+実CLI検証は次の明示コマンドで再実行できます。通常回帰はfake probe / ProcessTestHostを使います。
+
+```powershell
+& ./scripts/Test.ps1
+& ./tests/ImmichDesktopUploader.Tests/bin/Debug/net10.0/ImmichDesktopUploader.Tests.exe --connection-cli-check
+& ./scripts/SmokeTest-WinUI.ps1
+```
+
+Smokeのfake probeだけは待機を300msに短縮します。productionは30秒です。MSAA default actionが未対応のnative popupでは、実HMENUで確認した項目の矩形へ、そのtest popup宛てにmouse messageを送ります。個人profile・写真・Run registryは変更しません。
+
+### 制限と変更箇所
+
+実サーバーの資格情報は明示提供されていないため、実サーバーのReachable確認・network recovery upload E2Eは未実施です。loopback検証はそれらの代替証明ではありません。Windows logoff / shutdown、実ログイン時のRun起動も自動テストでは実行していません。
+
+報告されたメモリ読み取りクラッシュは、今回の隔離WinUI / Trayテストでは再現していません。原因特定・解消を保証するものではなく、発生操作と起動exeの確認が必要です。
+
+主な追加はApplication/ConnectionModels.cs、ConnectionMonitor.cs、Infrastructure/Immich/ImmichServerInfoProbe.cs、tests/Connections以下です。統合変更はAppCoordinator / UploadManager / DesktopApplicationService、Sessionのexhaustion metadata、MainWindow / MainViewModel、smoke profileとscripts、ProcessTestHostです。既存launcher / Job Object / retry policy / single-instance起動方式は変更していません。
+
+次は実際に使用する環境でのクラッシュ再現条件確認と、明示的なテスト用資格情報が用意できた場合の接続回復E2Eを推奨します。Windows通知、最終file logger、installer、MSIX等には進んでいません。コミットは行っていません。

@@ -18,6 +18,8 @@
      <TextBlock Text="Server" FontWeight="SemiBold"/>
      <TextBlock Text="{Binding ServerUrl}" TextWrapping="Wrap" AutomationProperties.AutomationId="ServerUrl"/>
      <TextBlock Text="{Binding CredentialText}" AutomationProperties.AutomationId="CredentialState"/>
+     <TextBlock Text="{Binding ConnectionText}" AutomationProperties.AutomationId="ConnectionState"/>
+     <TextBlock Text="{Binding ConnectionCheckedText}" AutomationProperties.AutomationId="ConnectionLastChecked"/>
      <TextBlock Text="{Binding ManagerText}" AutomationProperties.AutomationId="ManagerState" Foreground="{ThemeResource TextFillColorSecondaryBrush}"/>
      <TextBlock Text="{Binding StartupText}" TextWrapping="Wrap"/>
     </StackPanel>

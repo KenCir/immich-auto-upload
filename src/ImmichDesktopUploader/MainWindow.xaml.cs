@@ -24,7 +24,9 @@ public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindo
         InitializeComponent(); this.paths = paths; this.shutdownFence = shutdownFence; this.testExitCheckpoint = testExitCheckpoint;
         var diagnostics = new AppDiagnostics();
         model = new(new DesktopApplicationService(paths, diagnostics: diagnostics,
-            startup: new StartupService(Environment.ProcessPath!, smoke ? new SmokeTestProfile.StartupStore() : null)), new QueueDispatcher(DispatcherQueue), this, diagnostics);
+            startup: new StartupService(Environment.ProcessPath!, smoke ? new SmokeTestProfile.StartupStore() : null),
+            probeFactory: smoke ? _ => new SmokeTestProfile.Probe(paths) : null,
+            probeClock: smoke ? new SmokeTestProfile.ProbeClock() : null), new QueueDispatcher(DispatcherQueue), this, diagnostics);
         Root.DataContext = model;
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1040, 820));
         AppWindow.Closing += OnClosing;

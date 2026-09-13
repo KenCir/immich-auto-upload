@@ -4,26 +4,36 @@ using ImmichDesktopUploader.Infrastructure.Persistence;
 
 namespace ImmichDesktopUploader.Application;
 
-// Own this service for the app lifetime. No UI, registry, or network health checks.
+// Own the manager and the single connection monitor for the primary app lifetime.
 public sealed class AppCoordinator : IAsyncDisposable
 {
     private readonly ISettingsService settingsService;
     private readonly ICredentialService credentialService;
     private readonly Func<ImmichConnectionSettings, IUploadSessionFactory> factory;
     private readonly AppDiagnostics? diagnostics;
+    private readonly Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory;
+    private readonly ISessionClock? probeClock;
     private readonly object ingress = new();
     private Task tail = Task.CompletedTask;
     private Task? disposal;
     private bool closing;
     private UploadManager? manager;
     private ImmichConnectionSettings? connection;
+    private ConnectionMonitor? monitor;
+    private long connectionGeneration;
     public UploadManagerSnapshot? Snapshot => Volatile.Read(ref manager)?.Snapshot;
+    public ConnectionSnapshot Connection => Volatile.Read(ref monitor)?.Snapshot ?? ConnectionSnapshot.Initial;
 
     public AppCoordinator(ISettingsService settingsService, ICredentialService credentialService,
-        Func<ImmichConnectionSettings, IUploadSessionFactory>? factory = null, AppDiagnostics? diagnostics = null)
+        Func<ImmichConnectionSettings, IUploadSessionFactory>? factory = null, AppDiagnostics? diagnostics = null,
+        Func<ImmichConnectionSettings, IConnectionProbe>? probeFactory = null, ISessionClock? probeClock = null)
     {
         this.settingsService = settingsService; this.credentialService = credentialService;
         this.factory = factory ?? (c => new UploadSessionFactory(c)); this.diagnostics = diagnostics;
+        // Existing isolated session-factory tests opt into probes explicitly; never contact
+        // a server implicitly from a fake-runtime composition.
+        this.probeFactory = probeFactory ?? (factory is null ? c => new ImmichServerInfoProbe(c) : null);
+        this.probeClock = probeClock;
     }
 
     public Task StartAsync(CancellationToken token = default) => Submit(async () =>
@@ -38,10 +48,11 @@ public sealed class AppCoordinator : IAsyncDisposable
         lock (ingress)
         {
             CheckOpen();
-            replacement = new UploadManager(valid, factory(credentials), diagnostics);
+            replacement = new UploadManager(valid, factory(credentials), diagnostics, connectionGeneration: ++connectionGeneration);
             Volatile.Write(ref manager, replacement); connection = credentials;
         }
         await replacement.StartAllAsync().ConfigureAwait(false);
+        lock (ingress) { CheckOpen(); ConfigureMonitor(credentials, connectionGeneration); }
     }, token);
 
     public Task UpdateAsync(AppSettings draft, ImmichConnectionSettings? newCredentials = null, CancellationToken token = default)
@@ -75,18 +86,27 @@ public sealed class AppCoordinator : IAsyncDisposable
             }
             var state = old.Snapshot;
             // Dispose is the ownership fence. A failed cleanup prevents creation of the next backend context.
-            await old.DisposeAsync().ConfigureAwait(false);
+            Task oldCleanup;
+            long nextGeneration;
+            lock (ingress)
+            {
+                CheckOpen(); nextGeneration = ++connectionGeneration;
+                oldCleanup = old.DisposeAsync().AsTask();
+                ConfigureMonitor(confirmed, nextGeneration);
+            }
+            await oldCleanup.ConfigureAwait(false);
             var held = state.Folders.Where(f => f.ResumeBlocked ||
                 (state.IsPaused && f.Session.Status == UploadSessionStatus.Error)).Select(f => f.Folder.Id).ToImmutableHashSet();
             UploadManager replacement;
             lock (ingress)
             {
                 CheckOpen();
-                replacement = new UploadManager(validated, factory(confirmed), diagnostics, state.IsPaused, held);
+                replacement = new UploadManager(validated, factory(confirmed), diagnostics, state.IsPaused, held, nextGeneration);
                 Volatile.Write(ref manager, replacement); connection = confirmed;
             }
             if (state.RunningRequested) await replacement.StartAllAsync().ConfigureAwait(false);
             else await replacement.ApplySettingsAsync(validated).ConfigureAwait(false);
+            OnConnection(Connection);
         }, token);
     }
 
@@ -101,6 +121,25 @@ public sealed class AppCoordinator : IAsyncDisposable
         return result!;
     }
     private UploadManager RequireManager() => manager ?? throw new AppOperationException(AppFailure.MissingSettings);
+    private void ConfigureMonitor(ImmichConnectionSettings credentials, long generation)
+    {
+        if (probeFactory is null) return;
+        if (monitor is null)
+        {
+            monitor = new ConnectionMonitor(probeClock, diagnostics);
+            monitor.Changed += OnConnection;
+        }
+        monitor.Configure(probeFactory(credentials), generation);
+    }
+    private void OnConnection(ConnectionSnapshot snapshot)
+    {
+        lock (ingress)
+        {
+            if (closing || snapshot.ConnectionGeneration != connectionGeneration || manager is null) return;
+            try { _ = ObserveAsync(manager.ObserveConnectionAsync(snapshot)); }
+            catch (ObjectDisposedException) { /* Old manager is retiring; the new one receives the latest snapshot. */ }
+        }
+    }
     private static void Verify(AppSettings settings, ImmichConnectionSettings credentials)
     { if (settings.ServerUrl != credentials.ServerUrl) throw new AppOperationException(AppFailure.CredentialMismatch); }
     private static bool SameSettings(AppSettings a, AppSettings b) => a.SchemaVersion == b.SchemaVersion &&
@@ -131,8 +170,9 @@ public sealed class AppCoordinator : IAsyncDisposable
         {
             if (disposal is not null) return new(disposal);
             closing = true;
+            var monitorCleanup = monitor?.DisposeAsync().AsTask() ?? Task.CompletedTask;
             var cleanup = manager?.DisposeAsync().AsTask() ?? Task.CompletedTask;
-            disposal = DisposeCoreAsync(tail, cleanup); return new(disposal);
+            disposal = DisposeCoreAsync(tail, Task.WhenAll(cleanup, monitorCleanup)); return new(disposal);
         }
     }
     private async Task DisposeCoreAsync(Task previous, Task cleanup)

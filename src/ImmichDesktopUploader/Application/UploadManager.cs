@@ -1,7 +1,8 @@
 using System.Collections.Immutable;
 namespace ImmichDesktopUploader.Application;
 
-public sealed record ManagedFolderSnapshot(UploadFolderSettings Folder, SessionSnapshot Session, bool ResumeBlocked);
+public sealed record ManagedFolderSnapshot(UploadFolderSettings Folder, SessionSnapshot Session, bool ResumeBlocked,
+    RecoveryCandidate? RecoveryCandidate = null);
 public sealed record UploadManagerSnapshot(bool IsPaused, bool RunningRequested, ImmutableArray<ManagedFolderSnapshot> Folders,
     ImmutableArray<FolderOverlap> Warnings);
 public sealed record ManagerOperationResult(ImmutableArray<Guid> FailedFolderIds)
@@ -18,16 +19,19 @@ public sealed class UploadManager : IAsyncDisposable
     private bool closing, paused, running;
     private AppSettings settings;
     private readonly ImmutableHashSet<Guid> initialErrors;
+    private readonly long connectionGeneration;
+    private long connectionSequence, consumedOutage;
     private Published published = new(false, false, [], []);
 
     public UploadManager(AppSettings settings, IUploadSessionFactory factory, AppDiagnostics? diagnostics = null,
-        bool initiallyPaused = false, ImmutableHashSet<Guid>? heldErrors = null)
+        bool initiallyPaused = false, ImmutableHashSet<Guid>? heldErrors = null, long connectionGeneration = 0)
     {
         this.settings = SettingsValidation.Validate(settings).Settings;
         this.factory = factory;
         this.diagnostics = diagnostics;
         paused = initiallyPaused;
         initialErrors = heldErrors ?? [];
+        this.connectionGeneration = connectionGeneration;
         Publish();
     }
 
@@ -36,7 +40,7 @@ public sealed class UploadManager : IAsyncDisposable
         get
         {
             var view = Volatile.Read(ref published);
-            return new(view.Paused, view.Running, view.Folders.Select(f => new ManagedFolderSnapshot(f.Folder, f.Session.Snapshot, f.ResumeBlocked)).ToImmutableArray(), view.Warnings);
+            return new(view.Paused, view.Running, view.Folders.Select(f => new ManagedFolderSnapshot(f.Folder, f.Session.Snapshot, f.ResumeBlocked, f.Candidate)).ToImmutableArray(), view.Warnings);
         }
     }
 
@@ -70,6 +74,11 @@ public sealed class UploadManager : IAsyncDisposable
                 }
                 var changed = !SettingsValidation.SameRun(entry.Folder, folder);
                 var wasEnabled = entry.Folder.Enabled;
+                if (changed || wasEnabled != folder.Enabled)
+                {
+                    InvalidateRecovery(entry, folder.Enabled ? RecoverySuppressionReason.SettingsChanged : RecoverySuppressionReason.Disabled);
+                    entry.ConfigurationGeneration++;
+                }
                 entry.Folder = folder;
                 if (changed) { entry.Dirty = true; diagnostics?.Emit(AppEventKind.SessionChanged, folder.Id); }
                 if (wasEnabled && !folder.Enabled)
@@ -85,6 +94,7 @@ public sealed class UploadManager : IAsyncDisposable
     {
         if (paused) return;
         paused = true;
+        foreach (var entry in sessions.Values) InvalidateRecovery(entry, RecoverySuppressionReason.Paused);
         foreach (var entry in sessions.Values)
             entry.HoldError |= entry.Session.Snapshot.Status == UploadSessionStatus.Error;
         var result = await StopEntriesAsync(SessionStopReason.Paused, preserveErrors: true).ConfigureAwait(false);
@@ -106,6 +116,7 @@ public sealed class UploadManager : IAsyncDisposable
         if (entry.Quarantined) throw new AppOperationException(AppFailure.CleanupFailed);
         if (!entry.Folder.Enabled || paused) throw new AppOperationException(AppFailure.DisabledOrPaused);
         CheckOpen();
+        InvalidateRecovery(entry, RecoverySuppressionReason.UserStopped);
         entry.HoldError = false;
         running = true;
         if (entry.Dirty)
@@ -122,6 +133,7 @@ public sealed class UploadManager : IAsyncDisposable
         await Submit(async () =>
         {
             running = false;
+            foreach (var entry in sessions.Values) InvalidateRecovery(entry, RecoverySuppressionReason.UserStopped);
             result = await StopEntriesAsync(SessionStopReason.UserRequested).ConfigureAwait(false);
             diagnostics?.Emit(AppEventKind.ManagerStopped);
         }, token).ConfigureAwait(false);
@@ -157,6 +169,7 @@ public sealed class UploadManager : IAsyncDisposable
     }
     private async Task RemoveAsync(Entry entry)
     {
+        InvalidateRecovery(entry, RecoverySuppressionReason.Removed);
         var failed = false;
         try { await entry.Session.StopAsync(SessionStopReason.Removed).ConfigureAwait(false); }
         catch { failed = true; }
@@ -185,6 +198,67 @@ public sealed class UploadManager : IAsyncDisposable
     private static void ThrowIfFailed(ManagerOperationResult result)
     { if (!result.Success) throw new AppOperationException(AppFailure.CleanupFailed); }
 
+    // The same queue as Pause/Apply/Remove owns candidate registration and edge consumption.
+    // Checking retains LastCompletedStatus, so it does not end an unavailable period.
+    public Task ObserveConnectionAsync(ConnectionSnapshot connection, CancellationToken token = default) => Submit(async () =>
+    {
+        if (connection.ConnectionGeneration != connectionGeneration)
+        { Suppressed(null, RecoverySuppressionReason.StaleConnection); return; }
+        if (connection.Sequence <= connectionSequence)
+        { Suppressed(null, RecoverySuppressionReason.StaleEvent); return; }
+        connectionSequence = connection.Sequence;
+        if (connection.RecoveryEdge && connection.OutageId <= consumedOutage)
+        { Suppressed(null, RecoverySuppressionReason.AlreadyConsumed); return; }
+        if (connection.LastCompletedStatus == ConnectionStatus.Unavailable || connection.RecoveryEdge)
+        {
+            // Also reconcile immediately before consuming an edge: no polling race can
+            // miss an Error which arrived after the previous connection notification.
+            foreach (var entry in sessions.Values)
+            {
+                var error = entry.Session.Snapshot;
+                if (CanRecover(entry, error) && connection.OutageStartedAt is { } since &&
+                    error.LastError!.Timestamp >= since &&
+                    (!connection.RecoveryEdge || error.LastError.Timestamp <= connection.LastCheckedAt))
+                {
+                    var candidate = new RecoveryCandidate(entry.Folder.Id, connectionGeneration, entry.ConfigurationGeneration,
+                        connection.OutageId, error.RunGeneration, error.LastError.Timestamp);
+                    if (entry.Candidate != candidate)
+                    { entry.Candidate = candidate; diagnostics?.Emit(AppEventKind.RecoveryCandidateRegistered, entry.Folder.Id, generation: connectionGeneration); }
+                }
+            }
+        }
+        if (!connection.RecoveryEdge) return;
+        consumedOutage = connection.OutageId;
+        var candidates = sessions.Values.Where(e => e.Candidate is not null).Select(e => (Entry: e, Candidate: e.Candidate!)).ToArray();
+        // Consume before any await. Pause/Resume never replays a past edge.
+        foreach (var entry in sessions.Values) entry.Candidate = null;
+        if (paused || !running)
+        { Suppressed(null, paused ? RecoverySuppressionReason.Paused : RecoverySuppressionReason.UserStopped); return; }
+        foreach (var (entry, candidate) in candidates)
+        {
+            CheckOpen();
+            var current = entry.Session.Snapshot;
+            if (candidate.ConnectionGeneration != connectionGeneration || candidate.OutageId != connection.OutageId ||
+                candidate.ConfigurationGeneration != entry.ConfigurationGeneration || candidate.RunGeneration != current.RunGeneration ||
+                candidate.FailureAt != current.LastError?.Timestamp || !CanRecover(entry, current))
+            { Suppressed(entry.Folder.Id, RecoverySuppressionReason.NotError); continue; }
+            diagnostics?.Emit(AppEventKind.RecoveryAttempted, entry.Folder.Id, generation: connectionGeneration);
+            await InvokeIfOpen(() => entry.Session.RestartAsync()).ConfigureAwait(false);
+        }
+    }, token);
+
+    private bool CanRecover(Entry entry, SessionSnapshot state) => running && !paused && entry.Folder.Enabled &&
+        !entry.HoldError && !entry.Quarantined && state.Status == UploadSessionStatus.Error && state.RetryExhausted &&
+        state.LauncherPid is null && state.StopReason is null && state.RunGeneration > entry.RecoveryFloor &&
+        state.LastError is { Kind: SessionErrorKind.StartFailed or SessionErrorKind.UnexpectedExit or SessionErrorKind.ObservationFailed or SessionErrorKind.OutputFailed };
+    private void InvalidateRecovery(Entry entry, RecoverySuppressionReason reason)
+    {
+        if (entry.Candidate is not null) diagnostics?.Emit(AppEventKind.RecoveryCandidateDiscarded, entry.Folder.Id, generation: connectionGeneration, reason: reason);
+        entry.Candidate = null; entry.RecoveryFloor = entry.Session.Snapshot.RunGeneration;
+    }
+    private void Suppressed(Guid? id, RecoverySuppressionReason reason) =>
+        diagnostics?.Emit(AppEventKind.RecoverySuppressed, id, generation: connectionGeneration, reason: reason);
+
     private Task Submit(Func<Task> operation, CancellationToken token)
     {
         Task task;
@@ -210,7 +284,7 @@ public sealed class UploadManager : IAsyncDisposable
     private Task InvokeIfOpen(Func<Task> operation)
     { lock (ingress) { ObjectDisposedException.ThrowIf(closing, this); return operation(); } }
     private void Publish() => Volatile.Write(ref published, new(paused, running,
-        sessions.Values.Select(e => new PublishedFolder(e.Folder, e.Session, e.HoldError)).ToImmutableArray(),
+        sessions.Values.Select(e => new PublishedFolder(e.Folder, e.Session, e.HoldError, e.Candidate)).ToImmutableArray(),
         SettingsValidation.Validate(settings).Warnings));
 
     public ValueTask DisposeAsync()
@@ -235,6 +309,7 @@ public sealed class UploadManager : IAsyncDisposable
         // Observe also entries removed by the operation that was already in flight.
         await Task.WhenAll(stops.Values.Select(ObserveAsync)).ConfigureAwait(false);
         running = false;
+        foreach (var entry in sessions.Values) InvalidateRecovery(entry, RecoverySuppressionReason.Shutdown);
         var failures = await Task.WhenAll(sessions.Values.Select(async entry =>
         {
             var failed = false;
@@ -250,7 +325,9 @@ public sealed class UploadManager : IAsyncDisposable
         public UploadFolderSettings Folder = folder;
         public IManagedUploadSession Session { get; } = session;
         public bool Dirty, HoldError, Quarantined;
+        public long ConfigurationGeneration = 1, RecoveryFloor;
+        public RecoveryCandidate? Candidate;
     }
-    private sealed record PublishedFolder(UploadFolderSettings Folder, IManagedUploadSession Session, bool ResumeBlocked);
+    private sealed record PublishedFolder(UploadFolderSettings Folder, IManagedUploadSession Session, bool ResumeBlocked, RecoveryCandidate? Candidate);
     private sealed record Published(bool Paused, bool Running, ImmutableArray<PublishedFolder> Folders, ImmutableArray<FolderOverlap> Warnings);
 }

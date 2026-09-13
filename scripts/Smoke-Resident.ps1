@@ -19,6 +19,9 @@ public static class ResidentNative {
  [DllImport("user32.dll")] static extern int GetMenuItemCount(IntPtr menu);
  [DllImport("user32.dll",CharSet=CharSet.Unicode)] static extern int GetMenuString(IntPtr menu, uint item, StringBuilder text, int count, uint flags);
  [DllImport("user32.dll")] static extern uint GetMenuState(IntPtr menu, uint item, uint flags);
+ [DllImport("user32.dll")] static extern bool GetMenuItemRect(IntPtr window, IntPtr menu, uint item, out Rect rect);
+ [StructLayout(LayoutKind.Sequential)] public struct Point { public int X,Y; }
+ [DllImport("user32.dll")] static extern bool ScreenToClient(IntPtr window, ref Point point);
  [ComImport, Guid("618736e0-3c3d-11cf-810c-00aa00389b71"), InterfaceType(ComInterfaceType.InterfaceIsIDispatch)]
  public interface MenuAccessible { [DispId(-5018)] void DoDefaultAction([MarshalAs(UnmanagedType.Struct)] object child); }
  [DllImport("oleacc.dll")] static extern int AccessibleObjectFromWindow(IntPtr h, uint objectId, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out MenuAccessible accessible);
@@ -56,6 +59,18 @@ public static class ResidentNative {
     var iid=new Guid("618736e0-3c3d-11cf-810c-00aa00389b71"); MenuAccessible accessible;
     if(AccessibleObjectFromWindow(h,0xfffffffc,ref iid,out accessible)!=0) return false;
     try { accessible.DoDefaultAction((int)i+1); }
+    catch(COMException e) {
+     if(e.ErrorCode != unchecked((int)0x80020003)) throw;
+     // Some popup MSAA providers expose names but no default action. Use the verified
+     // item's native hit rectangle, targeting this test popup without moving the cursor.
+     Rect rect; if(!GetMenuItemRect(IntPtr.Zero,info.Menu,i,out rect)) return false;
+     var point=new Point { X=(rect.Left+rect.Right)/2, Y=(rect.Top+rect.Bottom)/2 };
+     if(!ScreenToClient(h,ref point)) return false;
+     var location=new IntPtr((point.Y << 16) | (point.X & 0xffff));
+     PostMessage(h,0x200,IntPtr.Zero,location);
+     PostMessage(h,0x201,new IntPtr(1),location);
+     PostMessage(h,0x202,IntPtr.Zero,location);
+    }
     finally { Marshal.ReleaseComObject(accessible); }
     return true;
    }
@@ -101,7 +116,10 @@ function Invoke-ResidentChecks([string]$appPath) {
         if ([ResidentNative]::Window($primary.Id) -ne $handle) { throw 'Window identity changed' }
         $created = @(Get-ChildItem -LiteralPath $env:TEMP -Directory -Filter 'ImmichGuiSmoke-*' | Where-Object { $_.FullName -notin $before })
         if ($created.Count -ne 1) { throw 'Secondary initialized another smoke storage profile' }
+        $probeCountPath = Join-Path $created[0].FullName 'probe-count'
+        Wait-Resident { (Test-Path -LiteralPath $probeCountPath) -and [int](Get-Content -LiteralPath $probeCountPath -Raw) -ge 2 } 'Primary monitor did not repeat probes'
         $window = [System.Windows.Automation.AutomationElement]::FromHandle($handle)
+        Wait-Resident { (Get-Control $window 'ConnectionState').Current.Name -eq 'Connection check succeeded' } 'Connection check GUI missing'
         Wait-Resident { (Get-Control $window 'ManagerState').Current.Name -eq 'Running requested' } 'Ready manager missing'
         foreach ($desired in @($true,$false)) {
             Wait-Resident { (Get-Control $window 'SettingsButton').Current.IsEnabled } 'Settings operation still busy'
@@ -126,6 +144,9 @@ function Invoke-ResidentChecks([string]$appPath) {
         Wait-Resident { (Get-Control $window 'ManagerState').Current.Name -eq 'Running requested' } 'Tray resume not reflected in GUI'
         $null = [ResidentNative]::PostMessage($handle, 0x10, [IntPtr]::Zero, [IntPtr]::Zero)
         Wait-Resident { -not [ResidentNative]::IsWindowVisible($handle) } 'Close did not hide'
+        $probeBeforeHide = [int](Get-Content -LiteralPath $probeCountPath -Raw)
+        Wait-Resident { [int](Get-Content -LiteralPath $probeCountPath -Raw) -gt $probeBeforeHide } 'Hidden window stopped connection probes'
+        if ([ResidentNative]::IsWindowVisible($handle)) { throw 'Connection probe showed hidden window' }
         Invoke-TrayMenu $primary $handle 'Open'
         Wait-Resident { [ResidentNative]::IsWindowVisible($handle) } 'Tray Open failed'
         # Simulate Explorer loss for this icon alone; never restart the user's Explorer.
@@ -149,6 +170,10 @@ function Invoke-ResidentChecks([string]$appPath) {
         Remove-Item -LiteralPath $hold
         if (-not $primary.WaitForExit(15000) -or $primary.ExitCode -ne 0) { throw 'Tray Exit failed' }
         if ([ResidentNative]::HasIcon($handle)) { throw 'Tray icon remained after Exit' }
+        $probeAfterExit = Get-Content -LiteralPath $probeCountPath -Raw
+        Start-Sleep -Milliseconds 500
+        if ((Get-Content -LiteralPath $probeCountPath -Raw) -ne $probeAfterExit) { throw 'Probe continued after Exit' }
+        Write-Output 'PASS Connection: primary-only repeated probes, separate GUI state, hidden monitoring, no probes after Exit'
         Write-Output 'PASS Resident: background, primary/secondary, same window, native tray Open/Pause/Resume/Exit, TaskbarCreated, startup GUI save, secondary during fenced shutdown, icon cleanup'
     } finally {
         if (-not $primary.HasExited) { $primary.Kill(); $primary.WaitForExit() }; $primary.Dispose()

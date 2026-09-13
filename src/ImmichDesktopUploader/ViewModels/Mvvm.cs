@@ -50,6 +50,13 @@ public interface IDesktopDialogs
 
 public static class UiText
 {
+    public static string Connection(ConnectionStatus status) => status switch
+    {
+        ConnectionStatus.Checking => "Checking…",
+        ConnectionStatus.Reachable => "Connection check succeeded",
+        ConnectionStatus.Unavailable => "Connection check failed",
+        _ => "Not checked"
+    };
     public static string Startup(StartupRegistration? registration, bool desired) => registration is null ? "自動起動の実状態はこの環境では取得しません。" :
         (registration.State switch
         {

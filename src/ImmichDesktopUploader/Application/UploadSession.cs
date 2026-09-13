@@ -212,7 +212,7 @@ public sealed class UploadSession : IManagedUploadSession
         // This is the only place a start is created. current remains owned until cleanup completes.
         var context = new RunContext(++nextGeneration, CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token));
         current = context;
-        Publish(snapshot with { Status = UploadSessionStatus.Starting, RunGeneration = context.Generation, LauncherPid = null, StopReason = null });
+        Publish(snapshot with { Status = UploadSessionStatus.Starting, RunGeneration = context.Generation, LauncherPid = null, StopReason = null, RetryExhausted = false });
         var request = new UploadRunRequest(configuration, context.Generation);
         Track(context.Generation, Task.Run(async () =>
         {
@@ -351,7 +351,7 @@ public sealed class UploadSession : IManagedUploadSession
             if (message.TreeConfirmed) ReleaseCurrent();
             else { context.Quarantined = true; context.Cancellation.Dispose(); }
             Publish(snapshot with { Status = UploadSessionStatus.Error, LauncherPid = message.TreeConfirmed ? null : context.Pid,
-                LastError = new(clock.UtcNow, SessionErrorKind.CleanupFailed, "Upload run cleanup could not be completed safely.", message.ExitCode) });
+                LastError = new(clock.UtcNow, SessionErrorKind.CleanupFailed, "Upload run cleanup could not be completed safely.", message.ExitCode), RetryExhausted = false });
             CompleteStopWaiters(false);
             return;
         }
@@ -376,7 +376,8 @@ public sealed class UploadSession : IManagedUploadSession
             fatal = true;
             desiredRunning = false;
             restartInProgress = false;
-            Publish(snapshot with { Status = UploadSessionStatus.Error, LauncherPid = null, LastError = error });
+            Publish(snapshot with { Status = UploadSessionStatus.Error, LauncherPid = null, LastError = error,
+                RetryExhausted = retryable && snapshot.RetryCount >= Backoffs.Length });
             return;
         }
         var count = snapshot.RetryCount + 1; // Counts the scheduled retry, including its backoff.

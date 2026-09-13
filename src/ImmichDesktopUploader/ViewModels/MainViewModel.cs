@@ -24,6 +24,8 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
     public bool IsPaused => state.Manager?.IsPaused == true;
     public bool NeedsAttention => state.Failure is not null || !state.CredentialsConfigured;
     public string StartupText => UiText.Startup(state.Startup, state.Settings?.StartWithWindows ?? false);
+    public string ConnectionText => UiText.Connection(state.Connection?.Status ?? ConnectionStatus.Unknown);
+    public string ConnectionCheckedText => "Last checked: " + (state.Connection?.LastCheckedAt?.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss") ?? "—");
     public bool CanRestore => state.CanRestoreBackup && !IsBusy;
     public string GlobalError { get => globalError; private set { if (Set(ref globalError, value)) Notify(nameof(HasGlobalError)); } }
     public bool HasGlobalError => GlobalError.Length != 0;
@@ -90,7 +92,7 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
             else if (Folders.IndexOf(row) != index) Folders.Move(Folders.IndexOf(row), index);
             row.Update(folder, next.Manager?.Folders.FirstOrDefault(f => f.Folder.Id == folder.Id)?.Session);
         }
-        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore), nameof(StartupText) }) Notify(property);
+        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore), nameof(StartupText), nameof(ConnectionText), nameof(ConnectionCheckedText) }) Notify(property);
         RefreshCommands();
     }
     private FolderEditorViewModel CreateEditor(UploadFolderSettings folder) => new(state.Settings!, folder, async replacement =>

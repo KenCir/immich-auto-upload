@@ -20,6 +20,7 @@ internal sealed class ManagerSession(UploadSessionConfiguration configuration) :
 {
     private SessionSnapshot snapshot = new(configuration.FolderId, UploadSessionStatus.Stopped, 0, null, 0, null, null, null, null);
     public SessionSnapshot Snapshot => Volatile.Read(ref snapshot);
+    public void Publish(SessionSnapshot value) => Volatile.Write(ref snapshot, value);
     public UploadSessionConfiguration Configuration { get; private set; } = configuration;
     public int Starts, Restarts, Applies, Stops, Disposals;
     public bool Disposed, FailStart, FailStop, FailDispose;
