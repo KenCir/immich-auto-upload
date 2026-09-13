@@ -68,9 +68,12 @@ public sealed class SettingsViewModel : ObservableModel, IDisposable
     private readonly bool configured;
     private string serverUrl, error = "";
     private string? newKey;
+    private bool startWithWindows;
     public string ServerUrl { get => serverUrl; set => Set(ref serverUrl, value); }
     public string CredentialText => configured ? "API key is configured（保存済みキーは表示しません）" : "API key is missing — 新しいキーを入力してください";
-    public bool StartWithWindows => original.StartWithWindows;
+    public bool StartWithWindows { get => startWithWindows; set => Set(ref startWithWindows, value); }
+    private string startupStateText;
+    public string StartupStateText { get => startupStateText; private set => Set(ref startupStateText, value); }
     public string Error { get => error; private set => Set(ref error, value); }
     public bool Saved { get; private set; }
     public bool CanEdit => !SaveCommand.IsBusy;
@@ -78,17 +81,24 @@ public sealed class SettingsViewModel : ObservableModel, IDisposable
     // PasswordBox bridge is write-only. No observable/public key property or stored-key retrieval.
     public void SetNewApiKey(string value) => newKey = value.Length == 0 ? null : value;
 
-    public SettingsViewModel(AppSettings original, bool configured, Func<AppSettings, ImmichConnectionSettings?, Task> save)
+    public SettingsViewModel(AppSettings original, bool configured, Func<AppSettings, ImmichConnectionSettings?, Task> save,
+        StartupRegistration? startup = null, Func<(StartupRegistration? Actual, bool Desired)>? refreshStartup = null)
     {
         this.original = original; this.configured = configured; serverUrl = original.ServerUrl;
+        startWithWindows = original.StartWithWindows; startupStateText = UiText.Startup(startup, original.StartWithWindows);
         SaveCommand = new(async () =>
         {
             var normalized = ImmichConnectionSettings.NormalizeServerUrl(ServerUrl);
             if (newKey is null && (normalized != original.ServerUrl || !configured))
                 throw new DraftValidationException("サーバーを変更する場合、または資格情報が未設定の場合は、新しいAPI Keyが必要です。");
-            var draft = SettingsValidation.Validate(original with { ServerUrl = normalized }).Settings;
+            var draft = SettingsValidation.Validate(original with { ServerUrl = normalized, StartWithWindows = StartWithWindows }).Settings;
             var replacement = newKey is null ? null : new ImmichConnectionSettings(normalized, newKey);
-            await save(draft, replacement); Saved = true; newKey = null;
+            try { await save(draft, replacement); Saved = true; newKey = null; }
+            finally
+            {
+                if (refreshStartup is not null)
+                { var current = refreshStartup(); StartupStateText = UiText.Startup(current.Actual, current.Desired); }
+            }
         }, e => Error = UiText.Error(e));
         SaveCommand.PropertyChanged += (_, _) => Notify(nameof(CanEdit));
     }

@@ -21,6 +21,9 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
     public string CredentialText => state.CredentialsConfigured ? "Credentials configured" : "Credentials missing / unavailable";
     public string ManagerText => state.Manager is null ? "Automatic uploads are not running" : state.Manager.IsPaused ? "Paused" : state.Manager.RunningRequested ? "Running requested" : "Stopped";
     public string PauseLabel => state.Manager?.IsPaused == true ? "Resume All" : "Pause All";
+    public bool IsPaused => state.Manager?.IsPaused == true;
+    public bool NeedsAttention => state.Failure is not null || !state.CredentialsConfigured;
+    public string StartupText => UiText.Startup(state.Startup, state.Settings?.StartWithWindows ?? false);
     public bool CanRestore => state.CanRestoreBackup && !IsBusy;
     public string GlobalError { get => globalError; private set { if (Set(ref globalError, value)) Notify(nameof(HasGlobalError)); } }
     public bool HasGlobalError => GlobalError.Length != 0;
@@ -43,10 +46,10 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
             using var draft = new SettingsViewModel(state.Settings ?? new AppSettings(), state.CredentialsConfigured,
                 async (settings, credentials) =>
                 {
-                    try { await application.SaveAsync(settings, credentials); }
+                    try { await application.SaveSettingsAsync(settings, credentials); }
                     catch { diagnostics?.Emit(AppEventKind.UiSettingsSaveFailed); throw; }
                     diagnostics?.Emit(AppEventKind.UiSettingsSaved); Apply(application.Snapshot);
-                });
+                }, state.Startup, () => (application.Snapshot.Startup, application.Snapshot.Settings?.StartWithWindows ?? false));
             await dialogs.EditSettingsAsync(draft);
         }), ShowError, () => !disposed && !IsBusy);
         PauseResumeCommand = new(() => BusyAsync(async () =>
@@ -87,7 +90,7 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
             else if (Folders.IndexOf(row) != index) Folders.Move(Folders.IndexOf(row), index);
             row.Update(folder, next.Manager?.Folders.FirstOrDefault(f => f.Folder.Id == folder.Id)?.Session);
         }
-        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore) }) Notify(property);
+        foreach (var property in new[] { nameof(ServerUrl), nameof(CredentialText), nameof(ManagerText), nameof(PauseLabel), nameof(CanRestore), nameof(StartupText) }) Notify(property);
         RefreshCommands();
     }
     private FolderEditorViewModel CreateEditor(UploadFolderSettings folder) => new(state.Settings!, folder, async replacement =>
@@ -126,7 +129,7 @@ public sealed class MainViewModel : ObservableModel, IAsyncDisposable
     internal void ShowError(Exception error) { GlobalError = UiText.Error(error); diagnostics?.Emit(AppEventKind.UiActionFailed); }
     private void RefreshCommands()
     {
-        AddCommand?.Refresh(); SettingsCommand?.Refresh(); PauseResumeCommand?.Refresh(); RestoreCommand?.Refresh();
+        AddCommand?.Refresh(); SettingsCommand?.Refresh(); PauseResumeCommand?.Refresh(); RestoreCommand?.Refresh(); OpenFolderCommand?.Refresh();
         Notify(nameof(CanRestore)); foreach (var row in Folders) row.Refresh();
     }
     public ValueTask DisposeAsync()

@@ -1,5 +1,6 @@
 using ImmichDesktopUploader.Application;
 using ImmichDesktopUploader.Infrastructure.Persistence;
+using ImmichDesktopUploader.Infrastructure.Windows;
 using ImmichDesktopUploader.ViewModels;
 using ImmichDesktopUploader.Views;
 using Microsoft.UI.Windowing;
@@ -9,48 +10,78 @@ using Windows.Storage.Pickers;
 
 namespace ImmichDesktopUploader;
 
-public sealed partial class MainWindow : Window, IDesktopDialogs
+public sealed partial class MainWindow : Window, IDesktopDialogs, IResidentWindow
 {
     private readonly MainViewModel model;
     private readonly AppStoragePaths paths;
-    private bool loaded, closing, closeApproved;
+    private readonly ResidentLifetime resident;
+    private readonly Action shutdownFence;
+    private readonly Func<Task>? testExitCheckpoint;
+    private bool closing, closeApproved;
     private ContentDialog? activeDialog;
-    public MainWindow(AppStoragePaths paths)
+    public MainWindow(AppStoragePaths paths, bool smoke, Action shutdownFence, Func<Task>? testExitCheckpoint = null)
     {
-        InitializeComponent(); this.paths = paths;
+        InitializeComponent(); this.paths = paths; this.shutdownFence = shutdownFence; this.testExitCheckpoint = testExitCheckpoint;
         var diagnostics = new AppDiagnostics();
-        model = new(new DesktopApplicationService(paths, diagnostics: diagnostics), new QueueDispatcher(DispatcherQueue), this, diagnostics);
+        model = new(new DesktopApplicationService(paths, diagnostics: diagnostics,
+            startup: new StartupService(Environment.ProcessPath!, smoke ? new SmokeTestProfile.StartupStore() : null)), new QueueDispatcher(DispatcherQueue), this, diagnostics);
         Root.DataContext = model;
         AppWindow.Resize(new Windows.Graphics.SizeInt32(1040, 820));
         AppWindow.Closing += OnClosing;
+        ITrayService tray;
+        try { tray = new TrayService(WinRT.Interop.WindowNative.GetWindowHandle(this)); }
+        catch { tray = new UnavailableTrayService(); }
+        resident = new(this, tray, ShutdownAsync, () => model.PauseResumeCommand.ExecuteAsync());
+        model.PropertyChanged += OnModelChanged;
     }
-    private async void OnLoaded(object sender, RoutedEventArgs args)
+    public async Task InitializeResidentAsync(bool background)
     {
-        if (loaded) return; loaded = true;
         await model.InitializeAsync();
+        resident.Update(model.IsPaused, model.PauseResumeCommand.CanExecute(null));
+        resident.Initialize(background, model.NeedsAttention);
     }
-    private async void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
+    private void OnModelChanged(object? sender, System.ComponentModel.PropertyChangedEventArgs args) =>
+        resident.Update(model.IsPaused, model.PauseResumeCommand.CanExecute(null));
+    public void OpenResident() => resident.Open();
+    private void OnClosing(AppWindow sender, AppWindowClosingEventArgs args)
     {
         if (closeApproved) return;
         args.Cancel = true;
-        if (closing) return; closing = true;
-        Root.IsHitTestVisible = false;
-        try
-        {
-            var pendingSave = activeDialog switch { FolderEditorDialog f => f.PendingSave, SettingsDialog s => s.PendingSave, _ => Task.CompletedTask };
-            activeDialog?.Hide();
-            await pendingSave;
-            await model.DisposeAsync();
-            closeApproved = true; AppWindow.Closing -= OnClosing; Close();
-        }
-        catch
-        {
-            // Keep the window visible on unconfirmed cleanup. Never claim a clean exit.
-            Root.IsHitTestVisible = true;
-            var error = new ContentDialog { XamlRoot = Root.XamlRoot, Title = "終了処理を確認できませんでした",
-                Content = "CLIプロセスの終了を確認できませんでした。プロセスの状態を確認してください。", CloseButtonText = "OK" };
-            await error.ShowAsync();
-        }
+        resident.CloseRequested();
+    }
+    private async Task ShutdownAsync()
+    {
+        var pendingSave = activeDialog switch { FolderEditorDialog f => f.PendingSave, SettingsDialog s => s.PendingSave, _ => Task.CompletedTask };
+        activeDialog?.Hide();
+        // Fence the application now, before waiting for an already accepted atomic save.
+        var cleanup = model.DisposeAsync().AsTask();
+        await pendingSave;
+        await cleanup;
+        if (testExitCheckpoint is not null) await testExitCheckpoint();
+    }
+    private async void OnExit(object sender, RoutedEventArgs args)
+    {
+        try { await resident.ExitAsync(); }
+        catch { /* ResidentLifetime keeps the failure visible and operations fenced. */ }
+    }
+    public void ShowAndActivate()
+    {
+        AppWindow.Show();
+        if (AppWindow.Presenter is OverlappedPresenter presenter && presenter.State == OverlappedPresenterState.Minimized) presenter.Restore();
+        Activate(); TrayService.RestoreAndForeground(WinRT.Interop.WindowNative.GetWindowHandle(this));
+    }
+    public void Hide() => AppWindow.Hide();
+    public void DisableInteraction()
+    {
+        closing = true; shutdownFence(); InteractionContainer.IsEnabled = false;
+        model.PropertyChanged -= OnModelChanged;
+    }
+    public void ReportLifetimeError(string safeMessage)
+    { LifetimeError.Message = safeMessage; LifetimeError.IsOpen = true; }
+    public void FinishExit()
+    {
+        closeApproved = true; AppWindow.Closing -= OnClosing; Close();
+        Microsoft.UI.Xaml.Application.Current.Exit();
     }
     public async Task<string?> PickFolderAsync()
     {

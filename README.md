@@ -1,8 +1,8 @@
-# Immich Desktop Uploader — Phase 1–5
+# Immich Desktop Uploader — Phase 1–6
 
-Windows 11 / x64 向け。プロセス基盤、設定保存、DPAPI、UploadManagerに加え、Phase 5の **WinUI GUI / ViewModel連携** を実装しています。Settingsから接続情報を保存し、フォルダ追加・編集・無効化・再起動を操作できます。
+Windows 11 / x64 向け。プロセス基盤、設定保存、DPAPI、UploadManager、WinUI GUIに加え、Phase 6の **Tray / single-instance / Windows自動起動** を実装しています。Settingsから接続情報と自動起動を保存し、フォルダ追加・編集・無効化・再起動を操作できます。
 
-通常起動では保存済み設定・資格情報を読み、有効なフォルダを開始します。window closeはCLI cleanup後にapp exitです。トレイ、自動起動、ConnectionMonitorは未実装です。通常テストは隔離データを使い、実アップロードを行いません。API直接呼出し・FileSystemWatcher・CLI/Node 自動インストールは行いません。
+通常起動では保存済み設定・資格情報を読み、有効なフォルダを開始します。**×はウィンドウを隠すだけで、CLIは継続します。終了はTrayのExitまたはExit applicationです。** `--background` は通常ウィンドウを表示せず常駐します。ConnectionMonitor・ネットワーク復旧・通知・最終file loggerは未実装です。通常テストは隔離データを使い、実アップロードを行いません。API直接呼出し・FileSystemWatcher・CLI/Node自動インストールは行いません。
 
 ## Build / run
 
@@ -42,7 +42,7 @@ dotnet build tests/ImmichDesktopUploader.Tests -p:FoundationOnly=true
 & ./tests/ImmichDesktopUploader.Tests/bin/Debug/net10.0/ImmichDesktopUploader.Tests.exe
 ```
 
-Smoke test は先に solution 全体をビルドした状態で実行してください。最小 WinUI ウィンドウの生成、応答、閉じる操作と exit code 0 を確認します。
+Smoke testは先にsolution全体をビルドし、Explorerの動作している通常の対話デスクトップで実行してください。WinUI binding、close→hide→Open、Trayの実メニュー、background、single-instance、明示Exitを検査します。管理者権限は不要ですが、Shellとの通信を禁止する制限トークンではTray登録できず、この検査は失敗します。その場合アプリはウィンドウを残すfallbackになります。
 
 ## Architecture / key classes
 
@@ -586,7 +586,9 @@ Phase 3テスト1件は、終了直後のEXE mappingによる共有違反を避�
 
 Phase 4時点ではGUI連携は次の候補でした。現在の実装は以下のPhase 5を参照してください。
 
-## Phase 5: WinUI GUI / ViewModel Integration
+## Phase 5: WinUI GUI / ViewModel Integration（当時の検証記録）
+
+Phase 6で変更した常駐・終了動作と現在の検証結果は末尾を参照してください。
 
 ### Architecture / ownership
 
@@ -678,7 +680,7 @@ smoke testはWindows標準UI Automationを使用し、MainViewの要素と実際
 7. Editでalbum等を変更し、同じフォルダ行の設定が更新されることを確認できます。複数の専用テストフォルダを使う場合は、他の行が再起動されないことも確認できます。
 8. Disableを押してStoppedを確認します。Task Managerでも対象launcher/Nodeが終了したことを確認します。
 9. 必要ならRemove確認で登録を外します。ローカル画像とサーバー画像は残ります。
-10. windowを閉じ、アプリと管理CLIが残らないことを確認します。
+10. 現在のPhase 6ではTrayのExitまたはExit applicationを選び、アプリと管理CLIが残らないことを確認します。
 
 今回実施したのは自動テストと隔離GUI smokeです。実サーバーを使うGUI E2E、FolderPickerの対話選択、実画像uploadは未実施です。Phase 3のUpload-E2E.ps1と実行コードは変更していません。
 
@@ -689,3 +691,108 @@ smoke testはWindows標準UI Automationを使用し、MainViewの要素と実際
 変更: App/MainWindowのXAMLとcode-behind、AppDiagnosticsのUIイベント、net10.0テストターゲットからUIコードを除外するcsproj、テスト入口、SmokeTest-WinUI.ps1、本README。既存のSettings/DPAPI/Manager/Session/process動作は変更していません。コミットは実行していません。
 
 状態反映には最大約500msの遅延があります。ディスク上の設定を外部編集した場合の自動reload、接続状態監視、toast、tray、Windows自動起動はありません。保存後のプロセスcleanup失敗まで全runtimeをrollbackするtransactionはPhase 4同様にありません。次の候補はtrayとwindow lifetimeの拡張ですが、今回その実装には進んでいません。
+
+## Phase 6: Tray / Window Lifetime / Single Instance / Auto Startup
+
+上のPhase 5節は当時の記録です。現在のwindow lifetimeは以下に置き換わっています。Phase 1〜3のlauncher、環境変数隔離、Job Object、backend、Session retry、RunGenerationは変更していません。
+
+### Trayとwindow lifetime
+
+`Infrastructure/Windows/TrayService`がWin32 `Shell_NotifyIcon`、標準システムアイコン、HWND subclass、native popup menuを所有します。P/InvokeはMainWindowに置きません。`Application/ResidentLifetime`はWindows APIを知らず、window/trayの境界と終了Taskを管理します。
+
+| 操作 | 動作 |
+|---|---|
+| 通常起動 | MainWindowを1つ生成して表示。既存設定のEnabledセッションを開始 |
+| × | closeをcancelし、Tray iconを確認してHide。Coordinator/Manager/Session/CLIは停止・Disposeしない |
+| Open | 同じMainWindowをShow、最小化をRestore、Activate。OSのforeground制限内で前面化 |
+| Pause All / Resume All | 既存MainViewModel command → DesktopApplicationService → UploadManager。GUIとTray labelは同じsnapshotを参照 |
+| Tray Exit / Exit application | 下記のgraceful shutdown。×とは別の明示操作 |
+| Tray初期化・再登録失敗 | エラーとwindowを表示。Trayを確認できない間は×でも隠さず、Exit applicationを残す |
+
+`TaskbarCreated` registered messageを受けると同じHWND/icon IDで再登録します。既存iconへのModifyを先に試し、消えている場合にAddするため、繰り返し通知でも同じ識別子のiconを増やしません。Exit中は再登録しません。tooltipは`Immich Desktop Uploader`です。
+
+### Single-instanceとbackground
+
+同期の`[STAThread] Main`で、XAML開始・設定読込・Coordinator/Manager生成より前に`AppInstance.FindOrRegisterForKey`を呼びます。secondaryはactivationをredirectし、その完了を待って終了します。primaryの分岐だけがAppとMainWindowを生成します。redirect失敗時もsecondaryが代わりにManagerを生成することはありません。
+
+secondaryのredirectはMTA workerで実行し、STAは`CoWaitForMultipleObjects`でCOM呼出しを処理しながら待機します。async Mainを使った途中ビルドではUI Automation時にネイティブアクセス違反が再現したため、同期Mainへ修正しました。[Microsoftのsingle-instanceパターン](https://learn.microsoft.com/en-us/windows/apps/windows-app-sdk/applifecycle/applifecycle-single-instance)に沿った方式です。
+
+通常のsecondary activationはprimaryのDispatcherQueueへOpenを送ります。MainWindow初期化前のactivationは保持し、準備後に同じwindowへ配送します。`--background`のsecondaryは表示を要求しません。Exit fence以降はactivationでwindowを再表示せず、プロセス終了までinstance登録を保持します。
+
+`--background`のprimaryはsettings/credentials/managerとtrayを初期化し、通常はwindowを最初から表示しません。初回未設定、設定破損、資格情報不一致、DPAPI失敗など操作が必要な初期化エラー、またはTray失敗時には表示します。フォルダ単位のSession Errorだけでは表示しません。
+
+### HKCU RunとSettings
+
+登録先は`HKCU\Software\Microsoft\Windows\CurrentVersion\Run`、固定値名は`ImmichDesktopUploader`です。HKLMや管理者権限は使用しません。値の型はREG_SZで、現在のexe絶対パスを必ずquoteします。このDebug buildで保存されるcommandは次の文字列です。
+
+```text
+"C:\Users\katyo\source\repos\immich-auto-upload\src\ImmichDesktopUploader\bin\Debug\net10.0-windows10.0.19041.0\win-x64\ImmichDesktopUploader.exe" --background
+```
+
+`StartupService.Inspect()`は未登録／現在のcommandで登録／異なるcommand／取得不可を区別します。`IsRegistered`は現在のcommandと一致する場合のみtrueです。settingsの`StartWithWindows`はdesired state、registryは実状態です。起動時は不一致をUIに表示し、勝手に修復しません。SettingsのSave時に現在のexe pathで登録し直すか、値を解除します。通常のフォルダ追加・編集・Enabled変更・削除ではRun登録を変更しません。
+
+保存順はdraft・既存設定・資格情報の検証 → registry変更・確認 → 既存Coordinatorによるcredentials/settings保存 → runtime適用です。registry変更失敗では設定とruntimeを変更せずdialogを残します。registry変更後に保存が失敗した場合はregistryをrollbackせず、不一致を即時snapshotとSettings内へ表示します。draftは保持され、Save再試行で修復できます。既存のcredentials/settings間の整合性検査・atomic saveは維持します。
+
+### Graceful shutdownとOS終了
+
+1. ExitのTaskを一つに固定し、activation・Tray・GUIをfence。操作中でもExitを受け付ける。
+2. 開いているdialogを閉じ、MainViewModel/desktop serviceから直ちに`AppCoordinator.DisposeAsync`を開始。CoordinatorはManagerの新操作受付も直ちに閉じ、Managerは既存全Sessionへ直ちに停止意図を届ける。他フォルダの長いcleanup待ちの間にもretryを抑止する。
+3. 開始済み永続化処理と進行中操作を待つ。保存完了後の新runtime適用・新Manager生成はfenceで拒否。
+4. Managerが全Sessionを停止・Disposeし、既存Job Objectによる全CLI tree cleanupを待つ。
+5. cleanup成功後にTray iconとsubclassを除去し、MainWindowを閉じてApplication.Exit。
+
+cleanupを確認できない場合は成功扱いで終了せず、windowにエラーを表示して操作を停止したままにします。正常なclose-to-trayではこのDispose経路に入りません。
+
+`WM_QUERYENDSESSION`では終了を拒否せず、`WM_ENDSESSION`で可能な範囲の非同期cleanupを開始します。OSログオフを長時間blockしません。OS強制終了、Task Manager kill、crash時の最終防衛は既存のJob kill-on-closeです。Windowsによる時間制限の中でgraceful cleanup完了を保証するものではありません。
+
+### Phase 6 verification（2026-09-13）
+
+| 検証 | 結果 |
+|---|---|
+| solution build | 警告0、エラー0 |
+| Phase 1〜5回帰 | 既存87件成功 |
+| Phase 6追加テスト | 13件成功。複数条件を組み合わせたlifetime・registry・shutdown競合ケースを含む |
+| 全console tests | **100成功、0失敗** |
+| WinUI smoke | first-run、2フォルダbinding、PasswordBox、×→Hide→Open→明示Exit成功 |
+| native Tray | 実Shell icon、実HMENUのOpen/Pause/Resume/ExitとGUI状態反映を確認 |
+| Explorer再起動相当 | 対象test iconだけを削除しTaskbarCreatedを繰り返し配送、再登録確認。Explorer自体は再起動していない |
+| AppInstance | background primary + background/normal secondary、同時起動、初期化前activation、Exit fence中secondaryを確認 |
+| startup | 実HKCUの専用テストbranchで登録・解除・quote・stale・cleanupを確認。GUIは隔離したmemory registryでON/OFF Saveを検証 |
+| 実process tree | ProcessTestHost treeがHide後も生存し、Resident Exit後に全PIDが消滅。既存実Immich launcher検証も成功 |
+
+`scripts/Smoke-Resident.ps1`は`SmokeTest-WinUI.ps1`から使用します。WinUI部分はUI Automation、native menu部分は実HMENUの文字列・有効状態を読みMSAAのdefault actionで操作します。ユーザーの写真や個人のRun値は変更しません。明示smoke profileだけが別AppInstance keyと新規一時profileを使い、ready profileは架空の資格情報・フォルダ0件なので実uploadをしません。Exit中redirect検証の待機markerもこの一時profileだけに限定しています。
+
+実サーバー用のE2E資格情報は提供されていないため、今回の実画像upload・実WindowsログインによるRun起動は未実施です。テスト成功を実サーバーupload成功とは扱いません。Phase 5のGUI操作・binding・保存・cleanup回帰は通っています。
+
+### 手動確認手順
+
+実uploadを試す場合は、空の専用テストフォルダとuploadしてよいテスト画像だけを使用してください。通常のVRChat/写真フォルダは検証に使わないでください。
+
+**Tray / close / Open**
+
+1. 通常起動し、専用テストフォルダのSessionがRunningであることとLauncher PIDを記録する。
+2. ×を押し、windowが消え、Tray iconと同じCLI treeが残ることを確認する。
+3. TrayのOpenを選び、同じwindowが復帰することを確認する。最小化状態からもOpenでRestoreする。
+
+**Pause / Resume**
+
+1. TrayのPause Allを選び、GUIのPausedとTrayのResume Allを確認する。
+2. 専用フォルダへテスト画像を1枚投入し、Pause中にuploadされないことをImmich側で確認する。
+3. TrayのResume Allを選び、保留画像がuploadされることをImmich側で確認する。CLIのwatch待ち時間を考慮する。
+
+**Windows自動起動**
+
+1. SettingsでStart with WindowsをONにしてSaveし、登録済み表示を確認する。
+2. TrayのExitで終了し、上記HKCU Run値が現在のexe pathと`--background`になっていることを確認する。
+3. Windowsへ再ログインするか、同じexeに`--background`を付けて手動起動する。正常設定ではwindowを出さずTrayのみで開始することを確認する。
+4. OpenでSessionの状態を確認し、再び×で隠す。
+5. 引数なしのexeを追加起動し、既存windowだけが表示され、app/CLIが二重にならないことを確認する。
+6. 自動起動が不要ならSettingsでOFFにしてSaveし、Run値が解除されたことを確認する。
+
+**Exit**
+
+1. 複数の専用テストSessionを動かし、必要ならwindowを隠した状態でTray Exitを選ぶ。
+2. icon消滅、app終了、記録したlauncher/Node/CLIの全PID消滅を確認する。
+3. 保存中・Restart中にもExitを試し、次回起動でsettingsが読み込めることを確認する。
+
+Phase 6ではConnectionMonitor、server-info定期実行、接続回復によるError Session再開、retry変更、backend変更、Windows通知、最終file loggerは追加していません。これらの次Phaseには自動的に進みません。コミットは行っていません。

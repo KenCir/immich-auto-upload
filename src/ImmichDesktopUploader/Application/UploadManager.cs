@@ -167,7 +167,7 @@ public sealed class UploadManager : IAsyncDisposable
             entry.Quarantined = true; entry.HoldError = true;
             throw new AppOperationException(AppFailure.CleanupFailed); // Retain identity; never replace uncertain ownership.
         }
-        sessions.Remove(entry.Folder.Id);
+        lock (ingress) sessions.Remove(entry.Folder.Id);
         diagnostics?.Emit(AppEventKind.SessionRemoved, entry.Folder.Id);
     }
 
@@ -219,19 +219,26 @@ public sealed class UploadManager : IAsyncDisposable
         {
             if (disposal is not null) return new(disposal);
             closing = true;
-            disposal = DisposeCoreAsync(tail);
+            // Deliver Stop intent immediately, even when the operation queue is waiting
+            // for another folder's cleanup. Session's existing intent fence cancels retry.
+            var stops = sessions.Values.ToDictionary(e => e.Session, e => StopForShutdownAsync(e.Session));
+            disposal = DisposeCoreAsync(tail, stops);
             return new(disposal);
         }
     }
-    private async Task DisposeCoreAsync(Task previous)
+    private static async Task StopForShutdownAsync(IManagedUploadSession session) =>
+        await session.StopAsync(SessionStopReason.ApplicationShutdown).ConfigureAwait(false);
+    private async Task DisposeCoreAsync(Task previous, Dictionary<IManagedUploadSession, Task> stops)
     {
         await Task.Yield();
         await previous.ConfigureAwait(false);
+        // Observe also entries removed by the operation that was already in flight.
+        await Task.WhenAll(stops.Values.Select(ObserveAsync)).ConfigureAwait(false);
         running = false;
         var failures = await Task.WhenAll(sessions.Values.Select(async entry =>
         {
             var failed = false;
-            try { await entry.Session.StopAsync(SessionStopReason.ApplicationShutdown).ConfigureAwait(false); } catch { failed = true; }
+            try { await stops[entry.Session].ConfigureAwait(false); } catch { failed = true; }
             try { await entry.Session.DisposeAsync().ConfigureAwait(false); } catch { failed = true; }
             return failed;
         })).ConfigureAwait(false);

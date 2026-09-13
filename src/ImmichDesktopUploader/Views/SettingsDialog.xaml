@@ -6,7 +6,8 @@
   <TextBlock Text="{Binding CredentialText}" TextWrapping="Wrap"/>
   <PasswordBox x:Name="NewKey" Header="New API Key" PasswordRevealMode="Hidden" PasswordChanged="OnPasswordChanged" AutomationProperties.AutomationId="ApiKeyInput"/>
   <TextBlock Text="空欄は既存キーを維持します。サーバーURLを変更する場合は新しいキーが必要です。" TextWrapping="Wrap"/>
-  <CheckBox Content="Start with Windows — Available in a later phase" IsChecked="{Binding StartWithWindows}" IsEnabled="False"/>
+  <CheckBox Content="Start with Windows" IsChecked="{Binding StartWithWindows, Mode=TwoWay}" AutomationProperties.AutomationId="StartWithWindows"/>
+  <TextBlock Text="{Binding StartupStateText}" TextWrapping="Wrap"/>
   <TextBlock Text="{Binding Error}" TextWrapping="Wrap" Foreground="{ThemeResource SystemFillColorCriticalBrush}"/>
   <ProgressRing IsActive="{Binding SaveCommand.IsBusy}" Width="24" Height="24"/>
  </StackPanel></ContentControl>

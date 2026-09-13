@@ -28,7 +28,7 @@ public sealed record UploadFolderSettings
 }
 
 public enum AppFailure { InvalidSettings, UnsupportedSchema, MissingSettings, CorruptSettings, StorageFailure,
-    MissingCredentials, InvalidCredentials, CredentialMismatch, CleanupFailed, DisabledOrPaused }
+    MissingCredentials, InvalidCredentials, CredentialMismatch, CleanupFailed, DisabledOrPaused, StartupFailure }
 public sealed class AppOperationException(AppFailure failure) : Exception($"Application operation failed: {failure}.")
 { public AppFailure Failure { get; } = failure; }
 public sealed record FolderOverlap(Guid ParentId, Guid ChildId);

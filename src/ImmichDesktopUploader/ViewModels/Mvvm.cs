@@ -50,6 +50,14 @@ public interface IDesktopDialogs
 
 public static class UiText
 {
+    public static string Startup(StartupRegistration? registration, bool desired) => registration is null ? "自動起動の実状態はこの環境では取得しません。" :
+        (registration.State switch
+        {
+            StartupRegistrationState.Registered => "Windows自動起動: 登録済み",
+            StartupRegistrationState.NotRegistered => "Windows自動起動: 未登録",
+            StartupRegistrationState.DifferentCommand => "Windows自動起動: 古いパスまたは異なるコマンドが登録されています",
+            _ => "Windows自動起動: レジストリを確認できません"
+        }) + (registration.Matches(desired) ? "" : "。設定と一致しません。SettingsのSaveで修復してください。");
     public static string Status(UploadSessionStatus status) => status switch
     {
         UploadSessionStatus.Stopped => "Stopped", UploadSessionStatus.Starting => "Starting…",
@@ -65,6 +73,7 @@ public static class UiText
         AppFailure.InvalidCredentials => "保存済みAPI Keyを復号できません。Settingsから再入力してください。",
         AppFailure.CredentialMismatch => "サーバーURLと保存済み資格情報が一致しません。SettingsからAPI Keyを再入力してください。",
         AppFailure.StorageFailure => "保存または読み込みに失敗しました。アクセス権・空き容量・ファイルの使用状況を確認してください。",
+        AppFailure.StartupFailure => "Windows自動起動の登録変更に失敗しました。アクセス権を確認してSaveを再試行してください。",
         AppFailure.CleanupFailed => "プロセスの終了を確認できませんでした。新しい起動は保留されています。",
         AppFailure.DisabledOrPaused => "無効または一時停止中です。有効化・Resume後に操作してください。",
         _ => "操作を完了できませんでした。設定を確認してください。"

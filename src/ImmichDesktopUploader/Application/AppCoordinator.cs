@@ -34,9 +34,13 @@ public sealed class AppCoordinator : IAsyncDisposable
         var valid = SettingsValidation.Validate(loaded.Settings!).Settings;
         var credentials = await credentialService.LoadAsync(valid.ServerUrl).ConfigureAwait(false);
         Verify(valid, credentials);
-        CheckOpen();
-        var replacement = new UploadManager(valid, factory(credentials), diagnostics);
-        Volatile.Write(ref manager, replacement); connection = credentials;
+        UploadManager replacement;
+        lock (ingress)
+        {
+            CheckOpen();
+            replacement = new UploadManager(valid, factory(credentials), diagnostics);
+            Volatile.Write(ref manager, replacement); connection = credentials;
+        }
         await replacement.StartAllAsync().ConfigureAwait(false);
     }, token);
 
@@ -72,11 +76,15 @@ public sealed class AppCoordinator : IAsyncDisposable
             var state = old.Snapshot;
             // Dispose is the ownership fence. A failed cleanup prevents creation of the next backend context.
             await old.DisposeAsync().ConfigureAwait(false);
-            CheckOpen();
             var held = state.Folders.Where(f => f.ResumeBlocked ||
                 (state.IsPaused && f.Session.Status == UploadSessionStatus.Error)).Select(f => f.Folder.Id).ToImmutableHashSet();
-            var replacement = new UploadManager(validated, factory(confirmed), diagnostics, state.IsPaused, held);
-            Volatile.Write(ref manager, replacement); connection = confirmed;
+            UploadManager replacement;
+            lock (ingress)
+            {
+                CheckOpen();
+                replacement = new UploadManager(validated, factory(confirmed), diagnostics, state.IsPaused, held);
+                Volatile.Write(ref manager, replacement); connection = confirmed;
+            }
             if (state.RunningRequested) await replacement.StartAllAsync().ConfigureAwait(false);
             else await replacement.ApplySettingsAsync(validated).ConfigureAwait(false);
         }, token);
@@ -122,13 +130,15 @@ public sealed class AppCoordinator : IAsyncDisposable
         lock (ingress)
         {
             if (disposal is not null) return new(disposal);
-            closing = true; disposal = DisposeCoreAsync(tail); return new(disposal);
+            closing = true;
+            var cleanup = manager?.DisposeAsync().AsTask() ?? Task.CompletedTask;
+            disposal = DisposeCoreAsync(tail, cleanup); return new(disposal);
         }
     }
-    private async Task DisposeCoreAsync(Task previous)
+    private async Task DisposeCoreAsync(Task previous, Task cleanup)
     {
         await Task.Yield(); await previous.ConfigureAwait(false);
-        if (manager is not null) await manager.DisposeAsync().ConfigureAwait(false);
+        await cleanup.ConfigureAwait(false);
         Volatile.Write(ref manager, null); connection = null;
     }
 }

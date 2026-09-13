@@ -240,6 +240,7 @@ await ImmichDesktopUploader.Tests.Management.UploadManagerTests.RunAllAsync(Test
 await ImmichDesktopUploader.Tests.Management.CoordinatorTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Gui.ViewModelTests.RunAllAsync(Test);
 await ImmichDesktopUploader.Tests.Gui.DesktopServiceTests.RunAllAsync(host, Test);
+await ImmichDesktopUploader.Tests.Residency.ResidentTests.RunAllAsync(host, Test);
 Console.WriteLine($"RESULT: {passed} passed, {failed} failed");
 return failed == 0 ? 0 : 1;
 
