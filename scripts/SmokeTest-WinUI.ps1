@@ -1,14 +1,22 @@
-param([ValidateSet('Debug','Release')][string]$Configuration = 'Debug')
+param(
+    [ValidateSet('Debug','Release')][string]$Configuration = 'Debug',
+    [string]$AppPath
+)
 $ErrorActionPreference = 'Stop'
 if ($PSVersionTable.PSEdition -eq 'Core') {
-    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" -NoProfile -ExecutionPolicy Bypass -File $PSCommandPath -Configuration $Configuration
+    $childArguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath, '-Configuration', $Configuration)
+    if ($AppPath) { $childArguments += @('-AppPath', $AppPath) }
+    & "$env:SystemRoot/System32/WindowsPowerShell/v1.0/powershell.exe" @childArguments
     exit $LASTEXITCODE
 }
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 . (Join-Path $PSScriptRoot 'Smoke-Resident.ps1')
 $repoRoot = Split-Path -Parent $PSScriptRoot
-$appPath = Join-Path $repoRoot "src/ImmichDesktopUploader/bin/$Configuration/net10.0-windows10.0.19041.0/win-x64/ImmichDesktopUploader.exe"
+if (-not $AppPath) {
+    $AppPath = Join-Path $repoRoot "src/ImmichDesktopUploader/bin/$Configuration/net10.0-windows10.0.19041.0/win-x64/ImmichDesktopUploader.exe"
+}
+$AppPath = (Resolve-Path -LiteralPath $AppPath).Path
 foreach ($profile in @('--smoke-test', '--smoke-test-folders')) {
 $instanceKey = '--smoke-instance=' + [Guid]::NewGuid().ToString('N')
 $appProcess = Start-Process -FilePath $appPath -ArgumentList @($profile,$instanceKey) -WindowStyle Hidden -PassThru

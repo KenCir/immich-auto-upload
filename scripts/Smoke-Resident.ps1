@@ -7,6 +7,7 @@ public static class ResidentNative {
  public delegate bool EnumProc(IntPtr hwnd, IntPtr parameter);
  [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
  [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, out uint p);
+ public static bool IsOwnedWindow(IntPtr h, uint processId) { uint owner; GetWindowThreadProcessId(h, out owner); return owner == processId; }
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
  [DllImport("user32.dll", CharSet=CharSet.Unicode)] static extern int GetClassName(IntPtr h, StringBuilder s, int n);
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
@@ -181,14 +182,21 @@ function Invoke-ResidentChecks([string]$appPath) {
             }
             $cancelPicker = Get-Control $script:observedPicker '2'
             if (-not $cancelPicker) { throw 'FolderPicker Cancel button was not found' }
+            $pickerHandle = [IntPtr]$script:observedPicker.Current.NativeWindowHandle
+            if ($pickerHandle -eq [IntPtr]::Zero) { throw 'FolderPicker native handle missing' }
+            # The picker can be hosted by a broker process, separate from the app.
+            $pickerProcessId = $script:observedPicker.Current.ProcessId
             $cancelPattern = $null
             if ($cancelPicker.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern,[ref]$cancelPattern)) {
                 $cancelPattern.Invoke()
-            } else {
-                # The native common dialog exposes IDCANCEL but may omit InvokePattern.
-                # Send its standard cancel command to the observed dialog only.
-                $pickerHandle = [IntPtr]$script:observedPicker.Current.NativeWindowHandle
-                if ($pickerHandle -eq [IntPtr]::Zero) { throw 'FolderPicker native handle missing' }
+                # Some common-dialog providers expose InvokePattern but leave the dialog open.
+                # Give the normal action time to complete before using its standard IDCANCEL.
+                $cancelDeadline = [DateTime]::UtcNow.AddSeconds(2)
+                while ([ResidentNative]::IsOwnedWindow($pickerHandle, $pickerProcessId) -and [ResidentNative]::IsWindowVisible($pickerHandle) -and [DateTime]::UtcNow -lt $cancelDeadline) {
+                    Start-Sleep -Milliseconds 50
+                }
+            }
+            if ([ResidentNative]::IsOwnedWindow($pickerHandle, $pickerProcessId) -and [ResidentNative]::IsWindowVisible($pickerHandle)) {
                 $null = [ResidentNative]::PostMessage($pickerHandle, 0x111, [IntPtr]2, [IntPtr]::Zero)
             }
             Wait-Resident { (Get-Control $window 'AddFolderButton').Current.IsEnabled } 'FolderPicker cancellation did not complete'
