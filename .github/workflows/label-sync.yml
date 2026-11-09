@@ -41,9 +41,11 @@ jobs:
     permissions:
       contents: read
       issues: write
+    # Hold the shared writer lock from the label snapshot through all updates.
     concurrency:
-      group: label-sync-${{ github.repository }}
+      group: repository-label-writes-${{ github.repository }}
       cancel-in-progress: false
+      queue: max
     steps:
       - name: Checkout current main definitions
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
