@@ -53,6 +53,21 @@ jobs:
       - name: Build Release (including WinUI)
         run: dotnet build ImmichDesktopUploader.sln --configuration Release --no-restore --nologo
 
+      # Use a private, predictable inheritable ACL for permission round-trip tests.
+      - name: Prepare isolated test temp directory
+        run: |
+          $testTemp = Join-Path $env:RUNNER_TEMP ('immich-tests-' + [guid]::NewGuid().ToString('N'))
+          New-Item -ItemType Directory -Path $testTemp | Out-Null
+          $acl = Get-Acl $testTemp
+          $acl.SetAccessRuleProtection($true, $false)
+          $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+          $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+            $sid, 'FullControl', 'ContainerInherit, ObjectInherit', 'None', 'Allow')
+          $acl.SetAccessRule($rule)
+          Set-Acl -LiteralPath $testTemp -AclObject $acl
+          "TEMP=$testTemp" | Add-Content $env:GITHUB_ENV
+          "TMP=$testTemp" | Add-Content $env:GITHUB_ENV
+
       # This is a console test runner, not a dotnet test project.
       - name: Run isolated tests
         run: ./scripts/Test-CI.ps1

@@ -39,7 +39,7 @@ Tests use isolated temporary storage, fake backends, ProcessTestHost, Windows Jo
 Objects, DPAPI and an isolated HKCU test key. They do not start the GUI application
 or contact an Immich server. The optional real CLI test, when CLI is present, only
 checks version/help and process cleanup; CI does not install Immich CLI. The existing
-runner labels CLI absence as PASS; the wrapper reports that case as one skip and
+runner labels CLI absence as PASS; the wrapper reports both optional checks as skips and
 subtracts it from successful/executed counts without changing any test assertions.
 
 `TestResults/tests.log` and `summary.md` are retained as the
@@ -72,10 +72,16 @@ NuGet package directory with HTTP cache disabled. Release solution build succeed
 with 0 warnings and 0 errors. The existing runtime/package settings were unchanged.
 The normal suite executed 139 tests: 139 passed, 0 failed, 0 skipped. Repeating with
 Immich CLI directories removed from the child PATH (matching a runner without CLI)
-executed 138 tests: 138 passed, 0 failed, 1 optional CLI check skipped. No server
+executed 137 tests: 137 passed, 0 failed, 2 optional CLI checks skipped (corrected
+reporting after identifying the second skip marker). No server
 connection or GUI application launch was performed.
 
 actionlint 1.7.12 validated workflow YAML and settings without errors. PowerShell AST
 parsing, diff whitespace checks and review of the three added files passed; no real
 credentials were added. Application source, existing tests and dependency versions
 have no changes. GitHub execution and its cache/artifact services remain unverified.
+
+The CI test step uses a private temporary directory with an explicit, inheritable
+current-user ACL. This isolates filesystem permission tests from the hosted image's
+default temporary-directory ACL. The first hosted run failed the existing test's
+ACL restoration equality assertion; no assertion or production code was changed.
