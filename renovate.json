@@ -1,0 +1,63 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)"
+  ],
+  "enabledManagers": ["nuget", "github-actions"],
+  "rangeStrategy": "bump",
+  "labels": ["Type: Dependencies"],
+  "prHourlyLimit": 5,
+  "minimumReleaseAge": "3 days",
+  "minimumReleaseAgeBehaviour": "timestamp-required",
+  "internalChecksFilter": "strict",
+  "automerge": false,
+  "dependencyDashboard": true,
+  "ignoreUnstable": true,
+  "vulnerabilityAlerts": {
+    "enabled": true,
+    "addLabels": ["Type: Security"],
+    "minimumReleaseAge": null,
+    "automerge": false
+  },
+  "packageRules": [
+    {
+      "matchManagers": ["nuget"],
+      "matchDatasources": ["nuget"],
+      "addLabels": ["nuget"]
+    },
+    {
+      "matchManagers": ["nuget"],
+      "matchDatasources": ["nuget"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "nuget patch updates",
+      "groupSlug": "nuget-patch"
+    },
+    {
+      "matchManagers": ["nuget", "github-actions"],
+      "matchUpdateTypes": ["minor", "major"],
+      "groupName": null
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "addLabels": ["github_actions"]
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["patch"],
+      "groupName": "github-actions patch updates",
+      "groupSlug": "gha-patch"
+    },
+    {
+      "matchDatasources": ["dotnet-version"],
+      "addLabels": ["dotnet"],
+      "groupName": null
+    },
+    {
+      "matchDatasources": ["dotnet-version"],
+      "matchUpdateTypes": ["major"],
+      "dependencyDashboardApproval": true
+    }
+  ]
+}
