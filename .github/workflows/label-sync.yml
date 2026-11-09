@@ -1,0 +1,60 @@
+name: label sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/labels.yml'
+      - '.github/workflows/label-sync.yml'
+  pull_request:
+    paths:
+      - '.github/labels.yml'
+      - '.github/workflows/label-sync.yml'
+
+permissions: {}
+
+jobs:
+  validate:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+    steps:
+      - name: Checkout proposed definitions (data only)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Preview label changes
+        uses: crazy-max/ghaction-github-labeler@548a7c3603594ec17c819e1239f281a3b801ab4d # v6.0.0
+        with:
+          github-token: ${{ github.token }}
+          yaml-file: .github/labels.yml
+          skip-delete: true
+          dry-run: true
+
+  label-sync:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    concurrency:
+      group: label-sync-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout current main definitions
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Queued older pushes must not restore obsolete definitions.
+          ref: main
+          persist-credentials: false
+      - name: Synchronize labels without deleting existing labels
+        uses: crazy-max/ghaction-github-labeler@548a7c3603594ec17c819e1239f281a3b801ab4d # v6.0.0
+        with:
+          github-token: ${{ github.token }}
+          yaml-file: .github/labels.yml
+          skip-delete: true
+          dry-run: false
