@@ -27,9 +27,9 @@ jobs:
       pull-requests: write
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Share the lock with the other PR label writer; keep both pending jobs.
+    # Share the lock with sync and both status writers, including other PRs.
     concurrency:
-      group: pr-labels-${{ github.repository }}-${{ github.event.pull_request.number }}
+      group: repository-label-writes-${{ github.repository }}
       cancel-in-progress: false
       queue: max
     steps:
@@ -37,6 +37,5 @@ jobs:
         with:
           repo-token: ${{ github.token }}
           configuration-path: .github/pr-labeler.yml
-          # Preserve manual classifications. Sync must create labels first;
-          # this job deliberately cannot create repository labels.
+          # Preserve manual classifications; sync owns canonical label metadata.
           sync-labels: false

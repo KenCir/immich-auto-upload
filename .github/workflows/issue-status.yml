@@ -8,8 +8,10 @@ permissions:
   issues: write
 
 concurrency:
-  group: issue-status-${{ github.repository }}-${{ github.event.issue.number }}
+  # Label assignment can create missing repository labels. Serialize all writers.
+  group: repository-label-writes-${{ github.repository }}
   cancel-in-progress: false
+  queue: max
 
 jobs:
   update-status:
@@ -29,7 +31,7 @@ jobs:
               duplicate: 'Status: Inactive(Duplicate)',
               abandoned: 'Status: Inactive(Abandoned)',
             };
-            // Pending events may be coalesced: use current API state rather
+            // Queued events may be stale: use current API state rather
             // than the event's old assignment/label snapshot.
             const { data: issue } = await github.rest.issues.get({
               ...context.repo, issue_number: context.payload.issue.number,

@@ -78,9 +78,9 @@ jobs:
     timeout-minutes: 5
     permissions:
       pull-requests: write
-    # Share the lock with the other PR label writer; keep both pending jobs.
+    # Label assignment can create missing labels; share sync's repository lock.
     concurrency:
-      group: pr-labels-${{ github.repository }}-${{ matrix.number }}
+      group: repository-label-writes-${{ github.repository }}
       cancel-in-progress: false
       queue: max
     steps:
