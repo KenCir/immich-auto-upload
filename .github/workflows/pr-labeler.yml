@@ -1,0 +1,42 @@
+name: 'Pull Request Labeler'
+
+on:
+  # Use base-branch configuration; never check out or execute PR code here.
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  # Fork reviews have no write token. Completion notifies pr-status.yml.
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+
+permissions: {}
+
+jobs:
+  review-notification:
+    if: github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Signal review state changed
+        run: echo 'Review event received; the trusted status workflow will reconcile it.'
+
+  labeler:
+    if: github.event_name == 'pull_request_target'
+    permissions:
+      contents: read
+      pull-requests: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Share the lock with the other PR label writer; keep both pending jobs.
+    concurrency:
+      group: pr-labels-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: actions/labeler@bf12e9b00b37c5c0ca2b87b79b2daf7891dbda13 # v7.0.0
+        with:
+          repo-token: ${{ github.token }}
+          configuration-path: .github/pr-labeler.yml
+          # Preserve manual classifications. Sync must create labels first;
+          # this job deliberately cannot create repository labels.
+          sync-labels: false

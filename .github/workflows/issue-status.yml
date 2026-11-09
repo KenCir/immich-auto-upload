@@ -1,0 +1,68 @@
+name: Issue status
+
+on:
+  issues:
+    types: [opened, closed, reopened, assigned, unassigned]
+
+permissions:
+  issues: write
+
+concurrency:
+  group: issue-status-${{ github.repository }}-${{ github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  update-status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Update issue status labels
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const labels = {
+              todo: 'Status: Todo',
+              inProgress: 'Status: In Progress',
+              completed: 'Status: Completed',
+              blocked: 'Status: Blocked',
+              invalid: 'Status: Inactive(Invalid)',
+              duplicate: 'Status: Inactive(Duplicate)',
+              abandoned: 'Status: Inactive(Abandoned)',
+            };
+            // Pending events may be coalesced: use current API state rather
+            // than the event's old assignment/label snapshot.
+            const { data: issue } = await github.rest.issues.get({
+              ...context.repo, issue_number: context.payload.issue.number,
+            });
+            if (issue.pull_request) return;
+            const current = new Set(issue.labels.map(label =>
+              typeof label === 'string' ? label : label.name));
+            let next;
+            if (issue.state === 'closed') {
+              // Preserve explicit closure classifications. Duplicate wins
+              // deterministically if conflicting manual classifications exist.
+              if (issue.state_reason === 'duplicate' || current.has(labels.duplicate)) next = labels.duplicate;
+              else if (current.has(labels.invalid)) next = labels.invalid;
+              else next = issue.state_reason === 'not_planned'
+                ? labels.abandoned : labels.completed;
+            } else if (current.has(labels.blocked)) {
+              next = labels.blocked;
+            } else {
+              next = issue.assignees.length > 0 ? labels.inProgress : labels.todo;
+            }
+            // Add first so a failed request cannot erase the only status.
+            if (!current.has(next)) {
+              await github.rest.issues.addLabels({
+                ...context.repo, issue_number: issue.number, labels: [next],
+              });
+            }
+            for (const name of Object.values(labels)) {
+              if (name === next || !current.has(name)) continue;
+              try {
+                await github.rest.issues.removeLabel({
+                  ...context.repo, issue_number: issue.number, name,
+                });
+              } catch (error) {
+                if (error.status !== 404) throw error;
+              }
+            }

@@ -1,0 +1,35 @@
+'Type: Feature':
+  - head-branch: ['^feature/', '^feat/']
+'Type: Bug':
+  - head-branch: ['^fix/', '^hotfix/']
+'Type: Testing':
+  - head-branch: ['^tests/']
+'Type: Refactoring':
+  - head-branch: ['^refactor/']
+'Type: Documentation':
+  - changed-files:
+      - any-glob-to-any-file: '**/*.md'
+      - any-glob-to-any-file: 'docs/**'
+'Type: CI':
+  - any:
+      - changed-files:
+          - any-glob-to-any-file: '.github/**'
+      - head-branch: ['^ci/']
+# Dedicated dependency files only: arbitrary .cs/.csproj edits are not updates.
+# Package updates confined to .csproj need explicit labels (e.g. future Renovate).
+'Type: Dependencies':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/global.json'
+          - '**/Directory.Packages.props'
+          - '**/packages.lock.json'
+          - '**/[Nn]u[Gg]et.[Cc]onfig'
+'dotnet':
+  - changed-files:
+      - any-glob-to-any-file: '**/global.json'
+'nuget':
+  - changed-files:
+      - any-glob-to-any-file:
+          - '**/Directory.Packages.props'
+          - '**/packages.lock.json'
+          - '**/[Nn]u[Gg]et.[Cc]onfig'
