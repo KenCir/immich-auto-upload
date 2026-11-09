@@ -11,7 +11,13 @@ dotnet build ImmichDesktopUploader.sln
 & ./src/ImmichDesktopUploader/bin/Debug/net10.0-windows10.0.19041.0/win-x64/ImmichDesktopUploader.exe
 ```
 
-Windows App SDK 1.8.260101001 は self-contained、.NET は framework-dependent です。Installer / MSIX はありません。
+Windows App SDK 1.8.260101001 は self-contained、.NET は framework-dependent です。GUIの起動には x64 の Microsoft.NETCore.App **10.0.14 以降の10.0系パッチ**が必要です。`RuntimeFrameworkVersion` と `RollForward=LatestPatch` で下限を指定し、ComWrappersの重複登録問題がある10.0.12では起動させません。SDKを更新しただけでは、実行中のプロセスのランタイムは変わりません。Installer / MSIX はありません。
+
+.NETランタイムも同梱して配布する場合は、次の明示的なself-contained発行を使用します。Windows App SDKとTargetFrameworkは通常ビルドと同じです。発行先のexeを起動し、実際にロードされた `coreclr.dll` のパスと製品バージョンを確認してください。稼働中のアプリを上書きせず、別の発行先を使用します。
+
+```powershell
+dotnet publish src/ImmichDesktopUploader/ImmichDesktopUploader.csproj -c Release -f net10.0-windows10.0.19041.0 -r win-x64 --self-contained true -o .build/publish
+```
 
 ## 使い方
 
@@ -64,6 +70,8 @@ secondary は長寿命 logger を作りません。受信した activation は p
 ```powershell
 ./scripts/Test.ps1
 ./scripts/SmokeTest-WinUI.ps1
+# 別の発行先を検証する場合
+./scripts/SmokeTest-WinUI.ps1 -AppPath .build/publish/ImmichDesktopUploader.exe
 ```
 
 Test.ps1 は独自 console runner です。`dotnet test` 単独では実行されません。通常テストは隔離データと ProcessTestHost を使用し、実写真をアップロードしません。Smoke は Explorer が動作する対話デスクトップで実行してください。Shell IPC を禁止する制限トークンでは Tray 登録が失敗します。
