@@ -40,7 +40,7 @@ Objects, DPAPI and an isolated HKCU test key. They do not start the GUI applicat
 or contact an Immich server. The optional real CLI test, when CLI is present, only
 checks version/help and process cleanup; CI does not install Immich CLI. The existing
 runner labels CLI absence as PASS; the wrapper reports both optional checks as skips and
-subtracts it from successful/executed counts without changing any test assertions.
+subtracts them from successful/executed counts without changing any test assertions.
 
 `TestResults/tests.log` and `summary.md` are retained as the
 `windows-release-test-results` artifact for 14 days, including on test failure.
@@ -79,9 +79,23 @@ connection or GUI application launch was performed.
 actionlint 1.7.12 validated workflow YAML and settings without errors. PowerShell AST
 parsing, diff whitespace checks and review of the three added files passed; no real
 credentials were added. Application source, existing tests and dependency versions
-have no changes. GitHub execution and its cache/artifact services remain unverified.
+have no changes. Hosted verification is recorded below.
 
 The CI test step uses a private temporary directory with an explicit, inheritable
 current-user ACL. This isolates filesystem permission tests from the hosted image's
 default temporary-directory ACL. The first hosted run failed the existing test's
 ACL restoration equality assertion; no assertion or production code was changed.
+
+## GitHub validation (2026-11-09)
+
+[PR #2](https://github.com/KenCir/immich-auto-upload/pull/2) hosted
+[run 42544105906](https://github.com/KenCir/immich-auto-upload/actions/runs/42544105906)
+completed successfully on windows-2025 with .NET SDK 10.0.403. Restore from a cache
+miss and the full Release build passed (0 warnings, 0 errors). The test artifact
+reports 137 executed/passed, 0 failed, 2 skipped because Immich CLI is not installed.
+Artifact upload and NuGet cache save also succeeded. The ACL restoration test passed
+unchanged with the dedicated temporary directory. The initial failed run also
+successfully published its failure log and summary.
+
+Push-to-main and manual-dispatch triggers still require verification after merging;
+this PR validation does not merge the change or run external/GUI/upload tests.
